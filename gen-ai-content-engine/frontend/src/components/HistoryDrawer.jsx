@@ -30,14 +30,33 @@ export default function HistoryDrawer({ isOpen, onClose, history, error, onSelec
               text: '¶', pdf: 'PDF', docx: 'DOCX', url: '🔗',
             }[sourceType] ?? '¶';
 
+            const score = item.consistency?.consistency_score;
+            const scoreColor = score == null ? null
+              : score >= 90 ? '#26DE81'
+              : score >= 70 ? '#F7B731'
+              : '#FC5C65';
+
             return (
               <div key={item.run_id} className="history-card">
                 <div className="history-card-header">
                   <span className="history-card-date">{date}</span>
-                  <span className="history-source-badge">{sourceIcon}</span>
+                  <div className="history-card-badges">
+                    {score != null && (
+                      <span
+                        className="history-consistency-badge"
+                        style={{ color: scoreColor }}
+                        title={`Consistency score: ${score}/100`}
+                      >
+                        ◉ {score}
+                      </span>
+                    )}
+                    <span className="history-source-badge">{sourceIcon}</span>
+                  </div>
                 </div>
                 <p className="history-card-source">{preview || '(no preview)'}</p>
                 <p className="history-card-outputs">
+                  <span className="history-format-count">{formats.length} format{formats.length !== 1 ? 's' : ''}</span>
+                  {' · '}
                   {formats.map((f) => f.replace(/_/g, ' ')).join(' · ')}
                 </p>
                 <div className="history-card-actions">

@@ -20,6 +20,7 @@ export const OUTPUT_OPTS = [
   { key: 'linkedin',           label: 'LinkedIn Post' },
   { key: 'x_thread',           label: 'X / Twitter Thread' },
   { key: 'presentation',       label: 'Presentation' },
+  { key: 'infographic',        label: 'Infographic' },
 ];
 
 const TONES = [
@@ -54,6 +55,7 @@ export default function App() {
     linkedin:          false,
     x_thread:          false,
     presentation:      false,
+    infographic:       false,
   });
   const [tone,     setTone]     = useState('Professional');
   const [audience, setAudience] = useState('Leadership / Execs');
@@ -62,7 +64,13 @@ export default function App() {
   const [loading,     setLoading]     = useState(false);
   const [loadingStep, setLoadingStep] = useState(0);
   const [engineErr,   setEngineErr]   = useState('');
-  const [result,      setResult]      = useState(null);   // { run_id, results: { fmt: {status, content, verification} } }
+  const [result,      setResult]      = useState(null);   // { run_id, results, consistency, ground_truth }
+
+  // ── Source versioning ─────────────────────────────────────────
+  const [loadedRunSource, setLoadedRunSource] = useState(null); // source text of loaded history run
+  const [sourceChanged,   setSourceChanged]   = useState(false);
+  const [affectedFormats, setAffectedFormats] = useState([]);
+  const [regenLoading,    setRegenLoading]    = useState(false);
 
   // ── History ───────────────────────────────────────────────────
   const [history,      setHistory]      = useState([]);
@@ -105,21 +113,27 @@ export default function App() {
     // Fetch full run (with outputs) — do NOT regenerate
     setShowHistory(false);
     setEngineErr('');
+    setSourceChanged(false);
+    setAffectedFormats([]);
     try {
       const res  = await fetch(`${GW_URL}/history/${encodeURIComponent(item.run_id)}`);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || 'Could not load this run.');
       setResult({
-        run_id: data.run_id,
-        results: data.results || {},
+        run_id:        data.run_id,
+        results:       data.results || {},
+        consistency:   data.consistency || null,
+        ground_truth:  data.ground_truth || null,
       });
       if (data.parameters) {
         setTone(data.parameters.tone || 'Professional');
         setAudience(data.parameters.audience || 'Leadership / Execs');
       }
       if (data.source?.content) {
-        setText(data.source.content.slice(0, 5000));
+        const src = data.source.content.slice(0, 5000);
+        setText(src);
         setSourceType('text');
+        setLoadedRunSource(src); // remember original source for version comparison
       }
     } catch (err) {
       setEngineErr(err.message || 'Could not load history run.');
@@ -133,6 +147,52 @@ export default function App() {
     setUrl('');
     setEngineErr('');
     setShowHistory(false);
+    setLoadedRunSource(null);
+    setSourceChanged(false);
+    setAffectedFormats([]);
+  };
+
+  // ── Source change detection ────────────────────────────────────
+  const handleTextChange = (newText) => {
+    setText(newText);
+    if (loadedRunSource !== null) {
+      setSourceChanged(newText.trim() !== loadedRunSource.trim());
+    }
+  };
+
+  // ── Surgical regeneration ─────────────────────────────────────
+  const handleRegenerate = async (formats) => {
+    if (!formats.length) return;
+    setRegenLoading(true);
+    setEngineErr('');
+    try {
+      const res = await fetch(`${GW_URL}/regenerate`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          run_id:   result?.run_id || '',
+          source:   text,
+          formats:  formats,
+          tone,
+          audience,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Regeneration failed.');
+      setResult({
+        run_id:       data.run_id,
+        results:      data.results || {},
+        consistency:  data.consistency || null,
+        ground_truth: data.ground_truth || null,
+      });
+      setLoadedRunSource(text);
+      setSourceChanged(false);
+      setAffectedFormats([]);
+    } catch (err) {
+      setEngineErr(err.message);
+    } finally {
+      setRegenLoading(false);
+    }
   };
 
   // ── Transform handler ─────────────────────────────────────────
@@ -185,7 +245,14 @@ export default function App() {
       }
 
       const data = await res.json();
-      setResult({ run_id: data.run_id, results: data.results });
+      setResult({
+        run_id:       data.run_id,
+        results:      data.results,
+        consistency:  data.consistency || null,
+        ground_truth: data.ground_truth || null,
+      });
+      setLoadedRunSource(null);
+      setSourceChanged(false);
     } catch (err) {
       setEngineErr(err.message);
     } finally {
@@ -303,7 +370,7 @@ export default function App() {
                 sourceType={sourceType}
                 onSourceTypeChange={setSourceType}
                 text={text}
-                onTextChange={setText}
+                onTextChange={sourceType === 'text' ? handleTextChange : setText}
                 file={file}
                 onFileChange={setFile}
                 url={url}
@@ -347,6 +414,10 @@ export default function App() {
               <span className="workspace-section-label" id="lbl-results">Results</span>
               <ResultsWorkspace
                 results={result.results}
+                consistency={result.consistency}
+                sourceChanged={sourceChanged}
+                onRegenerate={handleRegenerate}
+                regenLoading={regenLoading}
                 onCopy={handleCopy}
                 copied={copied}
                 onDownloadPptx={handleDownloadPptx}

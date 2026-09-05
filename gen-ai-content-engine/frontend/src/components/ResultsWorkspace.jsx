@@ -1,5 +1,7 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { OUTPUT_OPTS } from '../App';
+import InfographicCard from './InfographicCard';
+import VersionBanner from './VersionBanner';
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 function CopyIcon() {
@@ -63,6 +65,44 @@ function FormattedOutput({ content }) {
       </div>
     );
   });
+}
+
+// ── Claim Item (Phase 4: Why This? evidence popover) ─────────────────────────
+function ClaimItem({ claim }) {
+  const [showEvidence, setShowEvidence] = useState(false);
+  const isSupported = claim.status === 'supported';
+  return (
+    <div className={`claim-item claim-item--${isSupported ? 'supported' : 'unsupported'}`}>
+      <div className="claim-item-header">
+        <div className="claim-status-badge">
+          {isSupported ? '✓ Supported' : '⚠ Unsupported'}
+        </div>
+        {isSupported && claim.evidence && (
+          <button
+            type="button"
+            className="claim-why-btn"
+            onClick={() => setShowEvidence(v => !v)}
+            aria-expanded={showEvidence}
+            title="Show source evidence"
+          >
+            {showEvidence ? 'Hide source' : 'Why this?'}
+          </button>
+        )}
+      </div>
+      <p className="claim-text">{claim.claim}</p>
+      {isSupported && claim.evidence && showEvidence && (
+        <div className="claim-evidence-popover">
+          <span className="claim-evidence-label">Source evidence:</span>
+          <blockquote className="claim-evidence-quote">{claim.evidence}</blockquote>
+        </div>
+      )}
+      {!isSupported && (
+        <p className="claim-evidence claim-evidence--missing">
+          {claim.reason || 'No matching evidence found in source.'}
+        </p>
+      )}
+    </div>
+  );
 }
 
 // ── Verification Panel ────────────────────────────────────────────────────────
@@ -151,31 +191,97 @@ function VerificationPanel({ verification }) {
   );
 }
 
-function ClaimItem({ claim }) {
-  const isSupported = claim.status === 'supported';
+// ── Consistency Banner (Phase 3) ──────────────────────────────────────────────
+function ConsistencyBanner({ consistency }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!consistency) return null;
+
+  const score         = consistency.consistency_score ?? 100;
+  const contradictions = consistency.contradictions ?? [];
+  if (contradictions.length === 0) return null;
+
+  const severityColor = { high: '#FC5C65', medium: '#F7B731', low: '#45AAF2' };
+
   return (
-    <div className={`claim-item claim-item--${isSupported ? 'supported' : 'unsupported'}`}>
-      <div className="claim-status-badge">
-        {isSupported ? '✓ Supported' : '⚠ Unsupported'}
+    <div className="consistency-banner consistency-banner--warn">
+      <div className="consistency-banner-header">
+        <span className="consistency-icon">⚡</span>
+        <span>
+          <strong>{contradictions.length} cross-format {contradictions.length === 1 ? 'contradiction' : 'contradictions'} detected</strong>
+          {' '}&mdash; Consistency score: <strong>{score}/100</strong>
+        </span>
+        <button
+          type="button"
+          className="verif-toggle"
+          onClick={() => setExpanded(v => !v)}
+          aria-expanded={expanded}
+        >
+          {expanded ? 'Hide' : 'Review'}
+        </button>
       </div>
-      <p className="claim-text">{claim.claim}</p>
-      {isSupported && claim.evidence && (
-        <p className="claim-evidence">
-          <strong>Evidence:</strong> {claim.evidence}
-        </p>
-      )}
-      {!isSupported && (
-        <p className="claim-evidence claim-evidence--missing">
-          {claim.reason || 'No matching evidence found in source.'}
-        </p>
+      {expanded && (
+        <div className="consistency-detail-list">
+          {contradictions.map((c, i) => (
+            <div key={i} className="consistency-item">
+              <div className="consistency-item-meta">
+                <span
+                  className="consistency-severity-badge"
+                  style={{ color: severityColor[c.severity] || '#7F8C8D' }}
+                >
+                  {c.severity?.toUpperCase()}
+                </span>
+                <span className="consistency-formats-label">
+                  {(c.formats || []).join(' vs ')}
+                </span>
+              </div>
+              <div className="consistency-claims-row">
+                <div className="consistency-claim-block">
+                  <span className="consistency-claim-fmt">{(c.formats || [])[0]}</span>
+                  <p className="consistency-claim-text">"{c.claim_a}"</p>
+                </div>
+                <span className="consistency-vs">≠</span>
+                <div className="consistency-claim-block">
+                  <span className="consistency-claim-fmt">{(c.formats || [])[1]}</span>
+                  <p className="consistency-claim-text">"{c.claim_b}"</p>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
 }
 
+// ── Infographic PNG export (browser-side via html-to-image if available) ──────
+async function exportInfographicPng(element) {
+  try {
+    // Dynamically import html-to-image only if needed
+    const { toPng } = await import('html-to-image');
+    const dataUrl = await toPng(element, { cacheBust: true });
+    const a = document.createElement('a');
+    a.href = dataUrl;
+    a.download = 'omniformat-infographic.png';
+    a.click();
+  } catch {
+    // Fallback: open card in a new window for manual save
+    alert('PNG export not available. Use browser Print → Save as PDF/Image instead.');
+  }
+}
+
 // ── Main ResultsWorkspace ─────────────────────────────────────────────────────
-// results shape: { fmt_key: { status: 'success'|'error', content, verification, error } }
-export default function ResultsWorkspace({ results, onCopy, copied, onDownloadPptx, onDownloadPdf }) {
+// results shape: { fmt_key: { status: 'success'|'error', content, verification, infographic_data?, error } }
+export default function ResultsWorkspace({
+  results,
+  consistency,
+  sourceChanged,
+  onRegenerate,
+  regenLoading,
+  onCopy,
+  copied,
+  onDownloadPptx,
+  onDownloadPdf,
+}) {
   // Map from key → label
   const formatLabelMap = Object.fromEntries(OUTPUT_OPTS.map(({ key, label }) => [key, label]));
 
@@ -184,6 +290,11 @@ export default function ResultsWorkspace({ results, onCopy, copied, onDownloadPp
 
   const [activeTab, setActiveTab] = useState(tabs.length > 0 ? tabs[0].key : '');
   const [rawOpen,   setRawOpen]   = useState(false);
+
+  // Build a set of formats involved in contradictions for tab badge display
+  const contradictedFormats = new Set(
+    (consistency?.contradictions || []).flatMap(c => c.formats || [])
+  );
 
   if (tabs.length === 0) {
     return (
@@ -202,16 +313,34 @@ export default function ResultsWorkspace({ results, onCopy, copied, onDownloadPp
 
   const isPptxTab = validTab === 'presentation';
   const isPdfTab  = validTab === 'advisory' || validTab === 'executive_summary';
+  const isInfographic = validTab === 'infographic';
 
   const switchTab = (key) => { setActiveTab(key); setRawOpen(false); };
 
+  const handleExportPng = useCallback((element) => {
+    exportInfographicPng(element);
+  }, []);
+
   return (
     <div className="results-workspace" role="region" aria-label="Generated outputs">
+
+      {/* Source Changed / Version Banner */}
+      <VersionBanner
+        sourceChanged={sourceChanged}
+        results={results}
+        onRegenerate={onRegenerate}
+        regenLoading={regenLoading}
+      />
+
+      {/* Cross-Format Consistency Banner */}
+      <ConsistencyBanner consistency={consistency} />
+
       {/* Tab bar */}
       <div className="results-tabs" role="tablist" aria-label="Output formats">
         {tabs.map(({ key, label }) => {
           const r = results[key];
           const hasError = r?.status === 'error';
+          const hasConflict = contradictedFormats.has(key);
           return (
             <button
               key={key}
@@ -220,10 +349,16 @@ export default function ResultsWorkspace({ results, onCopy, copied, onDownloadPp
               aria-selected={key === validTab}
               aria-controls={`tabpanel-${key}`}
               id={`tab-${key}`}
-              className={`results-tab${key === validTab ? ' results-tab--active' : ''}${hasError ? ' results-tab--error' : ''}`}
+              className={[
+                'results-tab',
+                key === validTab ? 'results-tab--active' : '',
+                hasError ? 'results-tab--error' : '',
+                hasConflict ? 'results-tab--conflict' : '',
+              ].join(' ').trim()}
               onClick={() => switchTab(key)}
             >
-              {hasError && <span className="tab-error-dot" aria-label="error" />}
+              {hasError    && <span className="tab-error-dot"    aria-label="error" />}
+              {hasConflict && <span className="tab-conflict-dot" aria-label="contradiction" />}
               {label}
             </button>
           );
@@ -262,14 +397,29 @@ export default function ResultsWorkspace({ results, onCopy, copied, onDownloadPp
                     <DownloadIcon /> PDF
                   </button>
                 )}
-                <button
-                  type="button"
-                  className={`btn btn-ghost btn-sm${isCopied ? ' btn--copied' : ''}`}
-                  onClick={() => onCopy(content, validTab)}
-                  aria-label={`Copy ${formatLabelMap[validTab]} to clipboard`}
-                >
-                  {isCopied ? <><CheckIcon /> Copied</> : <><CopyIcon /> Copy</>}
-                </button>
+                {isInfographic && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm btn--download"
+                    onClick={() => {
+                      const el = document.querySelector('.infographic-card');
+                      if (el) handleExportPng(el);
+                    }}
+                    aria-label="Export infographic as PNG"
+                  >
+                    <DownloadIcon /> PNG
+                  </button>
+                )}
+                {!isInfographic && (
+                  <button
+                    type="button"
+                    className={`btn btn-ghost btn-sm${isCopied ? ' btn--copied' : ''}`}
+                    onClick={() => onCopy(content, validTab)}
+                    aria-label={`Copy ${formatLabelMap[validTab]} to clipboard`}
+                  >
+                    {isCopied ? <><CheckIcon /> Copied</> : <><CopyIcon /> Copy</>}
+                  </button>
+                )}
               </>
             )}
           </div>
@@ -290,11 +440,16 @@ export default function ResultsWorkspace({ results, onCopy, copied, onDownloadPp
         {isSuccess && (
           <>
             <div className="results-content">
-              <FormattedOutput content={content} />
+              {isInfographic
+                ? <InfographicCard content={currentResult.content} onExportPng={handleExportPng} />
+                : <FormattedOutput content={content} />
+              }
             </div>
 
-            {/* Verification panel */}
-            <VerificationPanel verification={currentResult.verification} />
+            {/* Verification panel (not for infographic) */}
+            {!isInfographic && (
+              <VerificationPanel verification={currentResult.verification} />
+            )}
           </>
         )}
 
