@@ -1445,3 +1445,314 @@ body::before { content:""; position:fixed; inset:0; pointer-events:none; z-index
   background: var(--bg-surface);
   border-color: var(--accent);
 }
+
+/* ── Source type tabs ────────────────────────────────────────── */
+.source-tabs {
+  display: flex;
+  gap: 2px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 3px;
+  margin-bottom: 12px;
+}
+
+.source-tab {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text-3);
+  font-size: var(--t-sm);
+  font-family: var(--font);
+  padding: 6px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: color var(--fast), background var(--fast);
+  font-weight: 500;
+}
+.source-tab:hover {
+  color: var(--text-2);
+}
+.source-tab--active {
+  background: var(--bg-raised);
+  color: var(--text-1);
+  border: 1px solid var(--border-focus);
+}
+
+/* ── URL input ───────────────────────────────────────────────── */
+.url-input-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.url-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 0 12px;
+  transition: border-color var(--fast);
+}
+.url-input-row:focus-within {
+  border-color: var(--border-active);
+}
+
+.url-icon {
+  color: var(--text-3);
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.url-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text-1);
+  font-size: var(--t-base);
+  font-family: var(--font);
+  padding: 12px 0;
+}
+.url-input::placeholder { color: var(--text-3); }
+.url-input--error { color: var(--error); }
+
+.url-clear {
+  background: none;
+  border: none;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.url-clear:hover { color: var(--text-2); }
+
+.url-error {
+  font-size: var(--t-sm);
+  color: var(--error);
+  margin: 0;
+}
+
+.url-hint {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  margin: 0;
+  line-height: var(--lh-relaxed);
+}
+
+/* ── Verification Panel ──────────────────────────────────────── */
+.verification-panel {
+  margin-top: 16px;
+  border-radius: var(--r);
+  border: 1px solid var(--border);
+  padding: 10px 14px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--t-sm);
+}
+
+.verification-panel--ok {
+  background: var(--success-subtle);
+  border-color: var(--success-border);
+  color: var(--success);
+}
+
+.verification-panel--warn {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: var(--accent-border);
+  color: var(--accent);
+}
+
+.verification-panel--unknown {
+  background: var(--bg-raised);
+  color: var(--text-3);
+}
+
+.verif-icon {
+  font-size: 14px;
+  flex-shrink: 0;
+}
+
+.verif-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: var(--t-sm);
+  font-family: var(--font);
+  text-decoration: underline;
+  padding: 0;
+  margin-left: auto;
+  color: inherit;
+  opacity: 0.8;
+}
+.verif-toggle:hover { opacity: 1; }
+
+.claim-list {
+  width: 100%;
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.claim-item {
+  border-radius: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.claim-item--supported {
+  background: var(--success-subtle);
+  border-color: var(--success-border);
+}
+
+.claim-item--unsupported {
+  background: var(--error-subtle);
+  border-color: var(--error-border);
+}
+
+.claim-status-badge {
+  font-size: var(--t-xs);
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+.claim-item--supported .claim-status-badge { color: var(--success); }
+.claim-item--unsupported .claim-status-badge { color: var(--error); }
+
+.claim-text {
+  font-size: var(--t-sm);
+  color: var(--text-1);
+  margin: 0;
+  line-height: var(--lh-normal);
+}
+
+.claim-evidence {
+  font-size: var(--t-xs);
+  color: var(--text-2);
+  margin: 0;
+  line-height: var(--lh-relaxed);
+  padding: 6px 8px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 4px;
+}
+.claim-evidence--missing {
+  color: var(--error);
+  opacity: 0.85;
+}
+
+/* ── Error state in results tab ──────────────────────────────── */
+.results-tab--error {
+  opacity: 0.7;
+}
+.tab-error-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--error);
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
+.results-error-state {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: var(--error-subtle);
+  border: 1px solid var(--error-border);
+  border-radius: var(--r);
+  padding: 16px;
+  margin: 16px 0;
+}
+.results-error-icon {
+  font-size: 18px;
+  color: var(--error);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.results-error-state strong {
+  display: block;
+  color: var(--error);
+  font-size: var(--t-base);
+  margin-bottom: 4px;
+}
+.results-error-state p {
+  color: var(--text-2);
+  font-size: var(--t-sm);
+  margin: 0;
+  line-height: var(--lh-relaxed);
+}
+
+/* ── Download button ─────────────────────────────────────────── */
+.btn--download {
+  color: var(--text-2);
+  gap: 4px;
+}
+.btn--download:hover {
+  color: var(--accent);
+  border-color: var(--accent-border);
+}
+
+/* ── Output selector hint ────────────────────────────────────── */
+.output-selector-hint {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  margin: 0;
+}
+
+/* ── Sidebar footer ──────────────────────────────────────────── */
+.sidebar-footer {
+  margin-top: auto;
+  padding: 14px 16px 18px;
+  border-top: 1px solid var(--border-sub);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sidebar-footer-text {
+  font-size: var(--t-sm);
+  color: var(--text-3);
+  font-weight: 500;
+}
+.sidebar-footer-sub {
+  font-size: var(--t-xs);
+  color: var(--text-3);
+  opacity: 0.6;
+}
+
+/* ── History updates ─────────────────────────────────────────── */
+.history-card-date {
+  font-size: 12px;
+  color: var(--text-2);
+  font-weight: 500;
+}
+.history-source-badge {
+  font-size: 10px;
+  background: var(--bg-overlay);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--text-3);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+.history-error {
+  color: var(--error);
+  font-size: var(--t-sm);
+  padding: 8px;
+  background: var(--error-subtle);
+  border-radius: var(--r-sm);
+  border: 1px solid var(--error-border);
+  margin: 0;
+}
+

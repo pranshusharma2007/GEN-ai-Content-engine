@@ -1,28 +1,25 @@
 import { useState, useEffect, useRef } from 'react';
 
-import AppShell            from './components/AppShell';
-import AuthScreen          from './components/AuthScreen';
-import SourceInput         from './components/SourceInput';
-import OutputSelector      from './components/OutputSelector';
-import GenerationControls  from './components/GenerationControls';
-import ResultsWorkspace    from './components/ResultsWorkspace';
-import Toast               from './components/Toast';
-import AnimatedContent     from './components/AnimatedContent';
-import HistoryDrawer       from './components/HistoryDrawer';
+import AppShell           from './components/AppShell';
+import SourceInput        from './components/SourceInput';
+import OutputSelector     from './components/OutputSelector';
+import GenerationControls from './components/GenerationControls';
+import ResultsWorkspace   from './components/ResultsWorkspace';
+import Toast              from './components/Toast';
+import AnimatedContent    from './components/AnimatedContent';
+import HistoryDrawer      from './components/HistoryDrawer';
 
 import './App.css';
 
-// Use environment variable with fallback for local development
 const GW_URL = import.meta.env.VITE_GEN_AI_API_URL || 'http://localhost:8000';
 
-const OUTPUT_OPTS = [
-  'Exec Summary',
-  'Advisory',
-  'LinkedIn Post',
-  'Video Script',
-  'Presentation',
-  'Twitter/X Thread',
-  'Infographic',
+// Format keys must match backend SUPPORTED_FORMATS
+export const OUTPUT_OPTS = [
+  { key: 'advisory',           label: 'Advisory' },
+  { key: 'executive_summary',  label: 'Executive Summary' },
+  { key: 'linkedin',           label: 'LinkedIn Post' },
+  { key: 'x_thread',           label: 'X / Twitter Thread' },
+  { key: 'presentation',       label: 'Presentation' },
 ];
 
 const TONES = [
@@ -41,40 +38,44 @@ const AUDIENCES = [
   'Stakeholders & Investors',
 ];
 
-const LOADING_STEP_INTERVAL_MS = 2000;
+const LOADING_STEP_INTERVAL_MS = 2500;
 
 export default function App() {
-  // ── Auth ──────────────────────────────────────────────────
-  const [isAuthed, setIsAuthed] = useState(false);
-  const [email,    setEmail]    = useState('');
-  const [history, setHistory] = useState([]);
-  const [historyError, setHistoryError] = useState('');
-  const [showHistory, setShowHistory] = useState(false);
-  const historyRequestRef = useRef(0);
-  const emailRef = useRef('');
-
-  // ── Transform state ───────────────────────────────────────
-  const [outputs, setOutputs] = useState({
-    'Exec Summary': true,
-    'Advisory':     true,
-    'LinkedIn Post': true,
-  });
-  const [tone,       setTone]       = useState('Professional');
-  const [audience,   setAudience]   = useState('Leadership / Execs');
+  // ── Source state ──────────────────────────────────────────────
+  const [sourceType, setSourceType] = useState('text'); // 'text' | 'file' | 'url'
   const [text,       setText]       = useState('');
   const [file,       setFile]       = useState(null);
-  const [loading,    setLoading]    = useState(false);
-  const [loadingStep,setLoadingStep]= useState(0);
-  const [engineErr,  setEngineErr]  = useState('');
-  const [result,     setResult]     = useState(null);
+  const [url,        setUrl]        = useState('');
 
-  // ── Copy / Toast ──────────────────────────────────────────
-  const [copied,      setCopied]      = useState('');
-  const [toastVisible,setToastVisible]= useState(false);
+  // ── Output / controls state ───────────────────────────────────
+  const [outputs, setOutputs] = useState({
+    advisory:          true,
+    executive_summary: true,
+    linkedin:          false,
+    x_thread:          false,
+    presentation:      false,
+  });
+  const [tone,     setTone]     = useState('Professional');
+  const [audience, setAudience] = useState('Leadership / Execs');
 
-  // ── Loading step cycling ──────────────────────────────────
+  // ── Generation state ──────────────────────────────────────────
+  const [loading,     setLoading]     = useState(false);
+  const [loadingStep, setLoadingStep] = useState(0);
+  const [engineErr,   setEngineErr]   = useState('');
+  const [result,      setResult]      = useState(null);   // { run_id, results: { fmt: {status, content, verification} } }
+
+  // ── History ───────────────────────────────────────────────────
+  const [history,      setHistory]      = useState([]);
+  const [historyError, setHistoryError] = useState('');
+  const [showHistory,  setShowHistory]  = useState(false);
+
+  // ── Toast ─────────────────────────────────────────────────────
+  const [copied,       setCopied]       = useState('');
+  const [toastVisible, setToastVisible] = useState('');
+
   const stepTimerRef = useRef(null);
 
+  // ── Loading step cycling ──────────────────────────────────────
   useEffect(() => {
     if (loading) {
       stepTimerRef.current = setInterval(() => {
@@ -86,84 +87,71 @@ export default function App() {
     return () => clearInterval(stepTimerRef.current);
   }, [loading]);
 
-  // ── Auth handlers ─────────────────────────────────────────
-  const handleAuth = (userEmail) => {
-    historyRequestRef.current += 1;
-    emailRef.current = userEmail;
-    setIsAuthed(true);
-    setEmail(userEmail);
-    setHistory([]);
-    setHistoryError('');
-    setShowHistory(false);
-  };
-
-  const logout = () => {
-    historyRequestRef.current += 1;
-    emailRef.current = '';
-    fetch(`${GW_URL}/auth/logout`, { method: 'POST', credentials: 'include' }).catch(() => {});
-    setIsAuthed(false);
-    setEmail('');
-    setHistory([]);
-    setHistoryError('');
-    setShowHistory(false);
-    setResult(null);
-    setText('');
-    setFile(null);
-    setEngineErr('');
-    setLoading(false);
-  };
-
+  // ── History handlers ──────────────────────────────────────────
   const openHistory = async () => {
-    const requestId = ++historyRequestRef.current;
-    const requestedEmail = email;
     setHistoryError('');
     try {
-      const res = await fetch(`${GW_URL}/history`, { credentials: 'include' });
+      const res  = await fetch(`${GW_URL}/history`);
       const data = await res.json().catch(() => ({}));
-      if (requestId !== historyRequestRef.current || emailRef.current !== requestedEmail) return;
-      if (res.status === 401) {
-        logout();
-        return;
-      }
       if (!res.ok) throw new Error(data.detail || `Unable to load history (${res.status}).`);
       setHistory(data.history || []);
     } catch (err) {
-      if (requestId !== historyRequestRef.current || emailRef.current !== requestedEmail) return;
       setHistoryError(err.message || 'Unable to load history.');
     }
-    if (requestId !== historyRequestRef.current || emailRef.current !== requestedEmail) return;
     setShowHistory(true);
   };
-  const selectHistory = (item) => { setResult(item.result || null); setText(item.source || ''); setTone(item.tone || 'Professional'); setAudience(item.audience || 'Leadership / Execs'); setShowHistory(false); };
-  const newWorkspace = () => { setResult(null); setText(''); setFile(null); setEngineErr(''); setShowHistory(false); };
-  const deleteHistory = async (id) => {
-    const requestedEmail = email;
+
+  const selectHistory = async (item) => {
+    // Fetch full run (with outputs) — do NOT regenerate
+    setShowHistory(false);
+    setEngineErr('');
     try {
-      const res = await fetch(`${GW_URL}/history/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'include' });
-      if (!res.ok) throw new Error('Unable to delete history item.');
-      if (emailRef.current === requestedEmail) {
-        setHistory((items) => items.filter((item) => item.id !== id));
+      const res  = await fetch(`${GW_URL}/history/${encodeURIComponent(item.run_id)}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || 'Could not load this run.');
+      setResult({
+        run_id: data.run_id,
+        results: data.results || {},
+      });
+      if (data.parameters) {
+        setTone(data.parameters.tone || 'Professional');
+        setAudience(data.parameters.audience || 'Leadership / Execs');
+      }
+      if (data.source?.content) {
+        setText(data.source.content.slice(0, 5000));
+        setSourceType('text');
       }
     } catch (err) {
-      if (emailRef.current === requestedEmail) {
-        setHistoryError(err.message);
-      }
+      setEngineErr(err.message || 'Could not load history run.');
     }
   };
 
-  // ── Transform handler ─────────────────────────────────────
+  const newWorkspace = () => {
+    setResult(null);
+    setText('');
+    setFile(null);
+    setUrl('');
+    setEngineErr('');
+    setShowHistory(false);
+  };
+
+  // ── Transform handler ─────────────────────────────────────────
   const transform = async (e) => {
     e.preventDefault();
 
     const selected = Object.keys(outputs).filter((k) => outputs[k]);
-
     if (!selected.length) {
       setEngineErr('Select at least one output format.');
       return;
     }
 
-    if (!text.trim() && !file) {
-      setEngineErr('Add source content — paste text or upload a file.');
+    const hasSource =
+      (sourceType === 'text'  && text.trim()) ||
+      (sourceType === 'file'  && file) ||
+      (sourceType === 'url'   && url.trim());
+
+    if (!hasSource) {
+      setEngineErr('Add source content — paste text, upload a file, or enter a URL.');
       return;
     }
 
@@ -173,30 +161,31 @@ export default function App() {
     setResult(null);
 
     const fd = new FormData();
-    if (file) fd.append('file', file);
-    if (text) fd.append('text', text);
+    fd.append('formats',  JSON.stringify(selected));
     fd.append('tone',     tone);
     fd.append('audience', audience);
-    fd.append('outputs',  JSON.stringify(selected));
+
+    if (sourceType === 'text') {
+      fd.append('text', text);
+    } else if (sourceType === 'file' && file) {
+      fd.append('file', file);
+    } else if (sourceType === 'url') {
+      fd.append('url', url.trim());
+    }
 
     try {
       const res = await fetch(`${GW_URL}/transform`, {
         method: 'POST',
         body:   fd,
-        credentials: 'include',
       });
-
-      if (res.status === 401) {
-        logout();
-        throw new Error('Your session expired. Please sign in again.');
-      }
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || `Server error (${res.status}).`);
       }
 
-      setResult(await res.json());
+      const data = await res.json();
+      setResult({ run_id: data.run_id, results: data.results });
     } catch (err) {
       setEngineErr(err.message);
     } finally {
@@ -206,45 +195,90 @@ export default function App() {
 
   const setAllOutputs = (val) => {
     const newOutputs = {};
-    OUTPUT_OPTS.forEach((opt) => {
-      newOutputs[opt] = val;
-    });
+    OUTPUT_OPTS.forEach(({ key }) => { newOutputs[key] = val; });
     setOutputs(newOutputs);
   };
 
-  // ── Copy ──────────────────────────────────────────────────
+  // ── Copy ──────────────────────────────────────────────────────
   const handleCopy = (content, key) => {
     navigator.clipboard.writeText(content).then(() => {
       setCopied(key);
-      setToastVisible(true);
-      setTimeout(() => {
-        setCopied('');
-        setToastVisible(false);
-      }, 1800);
+      setToastVisible('Copied to clipboard');
+      setTimeout(() => { setCopied(''); setToastVisible(''); }, 1800);
     });
   };
 
-  // ── Render ────────────────────────────────────────────────
-  if (!isAuthed) {
-    return <AuthScreen onAuth={handleAuth} gwUrl={GW_URL} />;
-  }
+  // ── Download PPTX ─────────────────────────────────────────────
+  const handleDownloadPptx = async (content) => {
+    try {
+      const res = await fetch(`${GW_URL}/export/pptx`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content, title: 'OmniFormat Presentation' }),
+      });
+      if (!res.ok) throw new Error('PPTX generation failed.');
+      const blob = await res.blob();
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = 'omniformat-presentation.pptx';
+      a.click();
+      URL.revokeObjectURL(href);
+      setToastVisible('PPTX downloaded');
+      setTimeout(() => setToastVisible(''), 2000);
+    } catch (err) {
+      setEngineErr(err.message);
+    }
+  };
 
+  // ── Download PDF ──────────────────────────────────────────────
+  const handleDownloadPdf = async (content, formatLabel) => {
+    try {
+      const res = await fetch(`${GW_URL}/export/pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content, format_name: formatLabel }),
+      });
+      if (!res.ok) throw new Error('PDF generation failed.');
+      const blob = await res.blob();
+      const href = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = href;
+      a.download = `omniformat-${formatLabel.toLowerCase().replace(/\s+/g, '-')}.pdf`;
+      a.click();
+      URL.revokeObjectURL(href);
+      setToastVisible('PDF downloaded');
+      setTimeout(() => setToastVisible(''), 2000);
+    } catch (err) {
+      setEngineErr(err.message);
+    }
+  };
+
+  const canGenerate =
+    (
+      (sourceType === 'text' && text.trim()) ||
+      (sourceType === 'file' && file) ||
+      (sourceType === 'url'  && url.trim())
+    ) && Object.values(outputs).some(Boolean);
+
+  // ── Render ────────────────────────────────────────────────────
   return (
-    <AppShell email={email} onLogout={logout} onHistory={openHistory} onNewWorkspace={newWorkspace} history={history} onSelectHistory={selectHistory} onDeleteHistory={deleteHistory}>
-      <HistoryDrawer 
-        isOpen={showHistory} 
-        onClose={() => setShowHistory(false)} 
-        history={history} 
-        onDelete={deleteHistory} 
-        onSelect={selectHistory} 
+    <AppShell onHistory={openHistory} onNewWorkspace={newWorkspace}>
+      <HistoryDrawer
+        isOpen={showHistory}
+        onClose={() => setShowHistory(false)}
+        history={history}
+        error={historyError}
+        onSelect={selectHistory}
       />
+
       <div className="workspace">
         {/* Top bar */}
         <AnimatedContent><header className="workspace-topbar">
-          <div className="eyebrow">CONTENT ENGINE / WORKSPACE</div>
-          <h1 className="workspace-title">Create content</h1>
+          <div className="eyebrow">OMNIFORMAT AI / WORKSPACE</div>
+          <h1 className="workspace-title">Content Engine</h1>
           <p className="workspace-subtitle">
-            Turn source material into useful, ready-to-publish formats.
+            Transform any source into advisory, summaries, social posts, and presentations — simultaneously.
           </p>
           <div className="progress" aria-label="Creation progress">
             <span className="progress-step progress-step--current"><b>01</b> Source material</span>
@@ -261,27 +295,37 @@ export default function App() {
 
             {/* Source content */}
             <AnimatedContent><section className="workspace-section" aria-labelledby="lbl-source">
-              <div className="section-heading"><div><span className="workspace-section-label" id="lbl-source">Source material</span><p className="section-helper">Paste a brief, notes, article, or transcript.</p></div></div>
+              <div className="section-heading"><div>
+                <span className="workspace-section-label" id="lbl-source">Source material</span>
+                <p className="section-helper">Paste text, upload a PDF or DOCX, or enter a URL.</p>
+              </div></div>
               <SourceInput
+                sourceType={sourceType}
+                onSourceTypeChange={setSourceType}
                 text={text}
                 onTextChange={setText}
                 file={file}
                 onFileChange={setFile}
+                url={url}
+                onUrlChange={setUrl}
               />
             </section></AnimatedContent>
 
             {/* Output formats */}
             <AnimatedContent><section className="workspace-section" aria-labelledby="lbl-formats">
-              <div className="section-heading"><div><span className="workspace-section-label" id="lbl-formats">Output formats</span><p className="section-helper">Choose the forms that fit your audience.</p></div></div>
+              <div className="section-heading"><div>
+                <span className="workspace-section-label" id="lbl-formats">Output formats</span>
+                <p className="section-helper">Agents run in parallel — select any combination.</p>
+              </div></div>
               <OutputSelector
                 outputs={outputs}
-                onToggle={(opt) => setOutputs((o) => ({ ...o, [opt]: !o[opt] }))}
+                onToggle={(key) => setOutputs((o) => ({ ...o, [key]: !o[key] }))}
                 onToggleAll={setAllOutputs}
                 options={OUTPUT_OPTS}
               />
             </section></AnimatedContent>
 
-            {/* Tone, audience, and submit */}
+            {/* Tone, audience, submit */}
             <GenerationControls
               tone={tone}           onToneChange={setTone}
               audience={audience}   onAudienceChange={setAudience}
@@ -289,7 +333,7 @@ export default function App() {
               loading={loading}
               loadingStep={loadingStep}
               error={engineErr}
-              canGenerate={!!(text.trim() || file) && Object.values(outputs).some(Boolean)}
+              canGenerate={canGenerate}
             />
 
           </form>
@@ -302,16 +346,18 @@ export default function App() {
             >
               <span className="workspace-section-label" id="lbl-results">Results</span>
               <ResultsWorkspace
-                result={result}
+                results={result.results}
                 onCopy={handleCopy}
                 copied={copied}
+                onDownloadPptx={handleDownloadPptx}
+                onDownloadPdf={handleDownloadPdf}
               />
             </section>
           )}
         </main>
       </div>
 
-      <Toast message="Copied to clipboard" visible={toastVisible} />
+      <Toast message={toastVisible} visible={!!toastVisible} />
     </AppShell>
   );
 }

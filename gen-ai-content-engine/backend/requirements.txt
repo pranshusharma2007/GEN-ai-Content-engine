@@ -1,9 +1,12 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 python-dotenv
 pypdf
-pytesseract
-Pillow
+python-docx
+httpx
+trafilatura
 groq
-mem0ai
+pymongo
+python-pptx
+reportlab

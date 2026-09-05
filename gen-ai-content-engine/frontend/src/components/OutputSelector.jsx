@@ -1,70 +1,71 @@
 const FORMAT_DESCRIPTIONS = {
-  'Exec Summary':     'Concise leadership-ready overview',
-  'Advisory':         'Strategic recommendation memo',
-  'LinkedIn Post':    'Professional social content',
-  'Video Script':     'Narrated script with scene beats',
-  'Presentation':     'Slide-ready talking points',
-  'Twitter/X Thread': 'Numbered, shareable thread',
-  'Infographic':      'Visual-first structured summary',
+  advisory:          'Formal strategic advisory bulletin',
+  executive_summary: 'Concise leadership-ready overview',
+  linkedin:          'High-engagement professional post',
+  x_thread:          'Numbered, shareable tweet thread',
+  presentation:      'Slide-by-slide deck with speaker notes',
 };
-const FORMAT_META = { 'Exec Summary':'3–5 min', Advisory:'Approx. 500 words', 'LinkedIn Post':'Approx. 150 words', 'Video Script':'2–3 min', Presentation:'8–10 slides', 'Twitter/X Thread':'6–8 posts', Infographic:'Visual outline' };
-const FORMAT_ICONS = { 'Exec Summary':'▤', Advisory:'◌', 'LinkedIn Post':'in', 'Video Script':'▶', Presentation:'▥', 'Twitter/X Thread':'#', Infographic:'▦' };
+
+const FORMAT_META = {
+  advisory:          'Approx. 500 words',
+  executive_summary: '3–5 min read',
+  linkedin:          '150–250 words',
+  x_thread:          '5–8 tweets',
+  presentation:      '7–10 slides',
+};
+
+const FORMAT_ICONS = {
+  advisory:          '◌',
+  executive_summary: '▤',
+  linkedin:          'in',
+  x_thread:          '#',
+  presentation:      '▥',
+};
 
 export default function OutputSelector({ outputs, onToggle, onToggleAll, options }) {
-  const selectedCount = options.filter((opt) => outputs[opt]).length;
+  const selectedCount = options.filter(({ key }) => outputs[key]).length;
   const allSelected   = selectedCount === options.length;
   const noneSelected  = selectedCount === 0;
-
-  const handleToggleAll = () => {
-    onToggleAll(!allSelected);
-  };
 
   return (
     <div className="output-selector">
       {/* Header row */}
       <div className="output-selector-header">
         <div className="output-meta">
-          <span className="output-count">
-            {selectedCount} selected
-          </span>
+          <span className="output-count">{selectedCount} selected</span>
           <button
             type="button"
             className="text-btn"
-            onClick={handleToggleAll}
-            disabled={noneSelected && !allSelected ? false : false}
+            onClick={() => onToggleAll(!allSelected)}
           >
             {allSelected ? 'Clear all' : 'Select all'}
           </button>
         </div>
+        <p className="output-selector-hint">All selected agents run concurrently</p>
       </div>
 
       {/* Format rows */}
-      <div
-        className="output-list"
-        role="group"
-        aria-label="Output format selection"
-      >
-        {options.map((opt) => {
-          const selected = !!outputs[opt];
+      <div className="output-list" role="group" aria-label="Output format selection">
+        {options.map(({ key, label }) => {
+          const selected = !!outputs[key];
           return (
             <button
               type="button"
-              key={opt}
+              key={key}
               className={`output-row${selected ? ' output-row--selected' : ''}`}
-              onClick={() => onToggle(opt)}
+              onClick={() => onToggle(key)}
               aria-pressed={selected}
-              aria-label={`${opt}: ${selected ? 'selected' : 'not selected'}`}
+              aria-label={`${label}: ${selected ? 'selected' : 'not selected'}`}
             >
               <span className="output-indicator" aria-hidden="true">
                 <span className="output-indicator-dot" />
               </span>
               <div className="output-content">
-                <span className="output-icon" aria-hidden="true">{FORMAT_ICONS[opt]}</span><span className="output-name">{opt}</span>
-                <span className="output-desc">
-                  {FORMAT_DESCRIPTIONS[opt] ?? ''}
-                </span>
+                <span className="output-icon" aria-hidden="true">{FORMAT_ICONS[key]}</span>
+                <span className="output-name">{label}</span>
+                <span className="output-desc">{FORMAT_DESCRIPTIONS[key] ?? ''}</span>
               </div>
-              <span className="output-format-meta">{FORMAT_META[opt]}</span>
+              <span className="output-format-meta">{FORMAT_META[key]}</span>
             </button>
           );
         })}
