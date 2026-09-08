@@ -1,17 +1,37 @@
-function SelectArrow() {
-  return (
-    <svg width="10" height="6" viewBox="0 0 10 6" fill="none" aria-hidden="true">
-      <path d="M1 1l4 4 4-4" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  );
-}
+import { cx, ui } from '../lib/ui';
 
 const LOADING_STEPS = [
-  'Normalizing source…',
-  'Running agents concurrently…',
+  'Normalising source…',
+  'Extracting ground truth…',
+  'Running format agents in parallel…',
   'Verifying claims against source…',
-  'Finalizing outputs…',
+  'Checking cross-format consistency…',
+  'Finalising outputs…',
 ];
+
+function SelectField({ id, label, value, onChange, options }) {
+  return (
+    <div>
+      <label htmlFor={id} className="mb-1.5 block text-xs font-medium text-ink-muted">{label}</label>
+      <div className="relative">
+        <select
+          id={id}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={cx(ui.field, 'omni-select appearance-none pr-9')}
+        >
+          {options.map((o) => <option key={o} value={o}>{o}</option>)}
+        </select>
+        <svg
+          className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-ink-subtle"
+          width="10" height="6" viewBox="0 0 10 6" fill="none" aria-hidden="true"
+        >
+          <path d="M1 1l4 4 4-4" stroke="currentColor" strokeWidth="1.25" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+      </div>
+    </div>
+  );
+}
 
 export default function GenerationControls({
   tone, onToneChange,
@@ -23,52 +43,41 @@ export default function GenerationControls({
   const stepLabel = LOADING_STEPS[loadingStep % LOADING_STEPS.length];
 
   return (
-    <div className="gen-controls">
-      {/* Tone + Audience */}
-      <div className="gen-row">
-        <div className="form-field">
-          <label className="form-label" htmlFor="select-tone">Tone</label>
-          <div className="select-wrap">
-            <select id="select-tone" className="form-select" value={tone} onChange={(e) => onToneChange(e.target.value)}>
-              {tones.map((t) => <option key={t} value={t}>{t}</option>)}
-            </select>
-            <span className="select-arrow"><SelectArrow /></span>
-          </div>
-        </div>
-
-        <div className="form-field">
-          <label className="form-label" htmlFor="select-audience">Target audience</label>
-          <div className="select-wrap">
-            <select id="select-audience" className="form-select" value={audience} onChange={(e) => onAudienceChange(e.target.value)}>
-              {audiences.map((a) => <option key={a} value={a}>{a}</option>)}
-            </select>
-            <span className="select-arrow"><SelectArrow /></span>
-          </div>
-        </div>
+    <div className="space-y-4 rounded-xl border border-line bg-surface p-5 shadow-panel">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <SelectField id="select-tone" label="Tone" value={tone} onChange={onToneChange} options={tones} />
+        <SelectField id="select-audience" label="Target audience" value={audience} onChange={onAudienceChange} options={audiences} />
       </div>
 
-      {/* Submit */}
-      <div className="sticky-action">
-        <div className="sticky-action-copy">
-          <strong>{loading ? 'Agents running' : 'Ready to generate'}</strong>
-          <span>{loading ? stepLabel : 'Each format runs as a separate specialised agent'}</span>
+      <div className="flex flex-col gap-3 rounded-lg border border-line bg-surface-2 p-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-ink">
+            {loading ? 'Agents running' : 'Ready to generate'}
+          </p>
+          <p className="truncate text-xs text-ink-muted">
+            {loading ? stepLabel : 'Each format runs as an independent specialised agent'}
+          </p>
         </div>
         <button
           type="submit"
-          className="btn btn-primary btn-full btn-generate"
           disabled={loading || !canGenerate}
           aria-busy={loading}
+          className={cx(ui.btnBase, ui.btnPrimary, ui.sizeMd, 'shrink-0 sm:w-auto')}
         >
           {loading ? (
-            <><span className="spinner" aria-hidden="true" /><span>{stepLabel}</span></>
+            <>
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" aria-hidden="true" />
+              Generating…
+            </>
           ) : (
             'Generate outputs'
           )}
         </button>
       </div>
 
-      {/* Error */}
-      {error && <p className="form-msg form-msg--error" role="alert">{error}</p>}
+      {error && (
+        <p className="rounded-md bg-danger-soft px-3 py-2 text-xs text-danger" role="alert">{error}</p>
+      )}
     </div>
   );
 }

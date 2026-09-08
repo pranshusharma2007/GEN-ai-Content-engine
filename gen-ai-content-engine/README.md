@@ -25,52 +25,59 @@ OmniFormat AI Engine transforms any raw source (pasted text, PDF documents, Word
 
 3. **Claim-Level Anti-Hallucination Verification**:
    - Cross-checks claims in each generated output against the ground-truth source material.
-   - Evaluates factual alignment, computes confidence scores, and flags unsupported claims.
+   - Flags unsupported claims inline (shown, not silently removed).
 
-4. **Export & Download**:
+4. **Tamper-Evident Integrity (SHA-256 hash-logging)**:
+   - Every output is fingerprinted with SHA-256 at generation time; the run carries a combined `run_hash`.
+   - `POST /verify` re-hashes any content against its recorded fingerprint — the UI shows a live ✓/✗ and a "tamper test" that breaks the hash on any edit.
+
+5. **Export & Download**:
    - Download slide decks as real PowerPoint (`.pptx`) presentations via `python-pptx`.
    - Download executive and advisory documents as clean formatted PDFs via `reportlab`.
 
-5. **MongoDB Persistence & History**:
-   - Full transformation runs, generated outputs, verification reports, and source metadata saved to MongoDB.
-   - Instant retrieval of past transformation runs from the slide-out history drawer.
+6. **Supabase Persistence & History**:
+   - Full transformation runs, outputs, verification results, integrity hashes and source metadata saved to Supabase (Postgres), scoped per user; local-JSON fallback when unconfigured.
+   - Instant retrieval of past runs from the slide-out history drawer.
 
-6. **LLM Provider Abstraction**:
-   - **Groq Adapter**: Ultra-fast inference with `llama-3.3-70b-versatile` (primary) and `llama3-8b-8192` (fallback).
-   - **Ollama Adapter (Stub)**: Provider-swappable architecture ready for on-premise/local LLM deployment.
+7. **Per-Format Multi-Provider Routing**:
+   - Each selected output format's agent runs on its **own assigned provider** (same source input for all) — default: LinkedIn & X-thread → **Groq**, Advisory / Executive Summary / Presentation / Infographic → **Gemini**. Override any of them via `LLM_FORMAT_*` env vars.
+   - Shared analysis passes (ground-truth, claim verification, consistency, diff) are task-routed to **Gemini**.
+   - Automatic cross-provider fallback — if a format's assigned provider fails, the other one serves it and the UI shows "(fallback from …)".
+   - `/health` exposes `format_routing`; the frontend tags every format card with its model.
+   - **Ollama Adapter (Stub)**: architecture ready for on-prem/local LLM.
+
+8. **Firebase Authentication**: Email/password + Google sign-in on the frontend; the backend verifies Firebase ID tokens — via `firebase-admin` when a service account is set, otherwise via `google-auth` against Google's public keys using only `FIREBASE_PROJECT_ID` — and scopes history per user. Dev-bypass until any Firebase config is supplied.
 
 ---
 
 ## 🛠️ Tech Stack
 
-- **Backend**: Python 3.10+, FastAPI, Uvicorn, Pydantic, Groq SDK, PyMongo, PyPDF, python-docx, Trafilatura, python-pptx, ReportLab.
-- **Frontend**: React 18, Vite, Vanilla CSS design system, Lucide-inspired SVG icons.
-- **Database**: MongoDB (Atlas or local).
+- **Backend**: Python 3.12, FastAPI, Uvicorn, Groq SDK, google-genai, firebase-admin, supabase-py, PyPDF, python-docx, Trafilatura, python-pptx, ReportLab.
+- **Frontend**: React 19, Vite, Tailwind CSS v4, Firebase Web SDK.
+- **Auth**: Firebase Authentication.
+- **Database**: Supabase (Postgres) with a local-JSON fallback for zero-setup demos.
 
 ---
 
 ## ⚡ Quick Start
 
 ### 1. Prerequisites
-- Python 3.10+
-- Node.js 18+ and npm
-- Groq API Key ([Get one free at console.groq.com](https://console.groq.com/))
-- MongoDB URI (Atlas free tier or local MongoDB instance)
+- Python 3.12
+- Node.js 20+ and npm (Vite 8 / Tailwind v4 require Node 20+)
+- A Groq and/or Gemini API key
+- Optional: a Firebase project (Authentication) and a Supabase project (history)
+
+The app runs with **no credentials** — a dev user is used and history is written to
+a local JSON file. Add credentials from `.env.example` to enable real auth + Supabase.
 
 ### 2. Configure Environment Variables
-Copy `.env.example` in the project root to `.env`:
+Copy `.env.example` in the project root to `.env` and fill in what you have:
 ```bash
 cp .env.example .env
 ```
-Update `.env` with your credentials:
-```env
-LLM_PROVIDER=groq
-GROQ_API_KEY=gsk_your_groq_api_key_here
-MONGODB_URI=mongodb+srv://<user>:<password>@cluster.mongodb.net/?retryWrites=true&w=majority
-MONGODB_DATABASE=omniformat_ai
-FRONTEND_ORIGINS=http://localhost:5173,http://localhost:3000
-VITE_GEN_AI_API_URL=http://localhost:8000
-```
+Key values: `GROQ_API_KEY` / `GEMINI_API_KEY`, the `VITE_FIREBASE_*` web config +
+`FIREBASE_SERVICE_ACCOUNT_JSON`, and `SUPABASE_URL` / `SUPABASE_SERVICE_KEY`
+(run `backend/supabase_schema.sql` once in the Supabase SQL editor).
 
 ### 3. Start the Backend Server
 ```bash
@@ -108,14 +115,21 @@ Open your browser at `http://localhost:5173`.
 
 ## 📡 API Endpoints Reference
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/health` | Service status, LLM provider, and DB connectivity |
-| `POST` | `/transform` | Normalize source, run parallel agents, verify claims, persist run |
-| `GET` | `/history` | Fetch recent transformation runs (id, timestamp, source type, formats) |
-| `GET` | `/history/{id}` | Retrieve full run details with all outputs and verification data |
-| `POST` | `/export/pptx` | Generate and download PowerPoint presentation (.pptx) |
-| `POST` | `/export/pdf` | Generate and download formatted PDF document (.pdf) |
+All endpoints except `/health` accept an `Authorization: Bearer <Firebase ID token>`
+header (enforced when `AUTH_REQUIRED=true`; dev-bypass otherwise).
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| `GET` | `/health` | — | Service status, available LLM providers, routing, storage backend |
+| `POST` | `/transform` | ✓ | Normalize source, run parallel agents, verify claims, SHA-256 hash-log each output, persist run |
+| `GET` | `/history` | ✓ | Recent transformation runs for the current user |
+| `GET` | `/history/{id}` | ✓ | Full run details with all outputs and verification data |
+| `POST` | `/verify` | ✓ | Re-hash `{run_id, format_name, content?}` against the fingerprint recorded at generation → `{verified, stored_hash, computed_hash}` |
+| `GET` | `/verify/{id}/{format}` | ✓ | Storage-integrity check — re-hash the stored copy of one output |
+| `POST` | `/regenerate` | ✓ | Surgically regenerate selected formats against an updated source |
+| `POST` | `/compare_versions` | ✓ | Diff two source versions, list changed facts + affected formats |
+| `POST` | `/export/pptx` | ✓ | Generate and download a PowerPoint presentation (.pptx) |
+| `POST` | `/export/pdf` | ✓ | Generate and download a formatted PDF document (.pdf) |
 
 ---
 
@@ -123,35 +137,29 @@ Open your browser at `http://localhost:5173`.
 
 ```
 +-------------------------------------------------------------+
-|                      React / Vite UI                        |
-|   (Pasted Text / PDF / DOCX / URL + Format/Tone Selection)  |
+|              React + Vite + Tailwind UI                     |
+|   Firebase Auth gate → workspace (Text / PDF / DOCX / URL)  |
 +------------------------------+------------------------------+
-                               | POST /transform
+                               | POST /transform  (Bearer ID token)
                                v
 +-------------------------------------------------------------+
-|                 FastAPI Source Normalizer                   |
+|   FastAPI  ·  verify Firebase token  ·  Source Normalizer   |
 | (SSRF-protected URL fetch, PyPDF, python-docx, sanitization)|
 +------------------------------+------------------------------+
-                               | Normalized ground truth text
+                               | Normalized source
                                v
 +-------------------------------------------------------------+
-|               Concurrent Multi-Agent Engine                 |
-|   (Advisory, Executive, LinkedIn, X Thread, Presentation)   |
-|               asyncio.gather(agent_1 ... agent_5)           |
-+------------------------------+------------------------------+
-                               | Generated outputs
-                               v
-+-------------------------------------------------------------+
-|             Anti-Hallucination Verification                 |
-|        (Claim extraction & verification against source)     |
+|   Ground-truth extraction (Gemini)                          |
+|   Concurrent Multi-Agent Engine (Groq) — asyncio.gather     |
+|   Claim verification + cross-format consistency (Gemini)    |
 +------------------------------+------------------------------+
                                |
             +------------------+------------------+
             |                                     |
             v                                     v
 +-----------------------+             +-----------------------+
-|  MongoDB Persistence  |             |  Side-by-Side Results |
-| (History & Audit Log) |             |  (Copy / PPTX / PDF)  |
+|  Supabase (Postgres)  |             |  Side-by-Side Results |
+|  per-user run history |             |  (Copy / PPTX / PDF)  |
 +-----------------------+             +-----------------------+
 ```
 

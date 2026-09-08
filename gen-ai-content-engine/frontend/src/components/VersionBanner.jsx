@@ -1,64 +1,65 @@
 /**
- * VersionBanner — shown when a history run's source has been modified.
- * Lets the user select which formats to regenerate surgically.
+ * VersionBanner — shown when a loaded history run's source has been edited.
+ * Lets the user surgically regenerate selected formats against the new source.
  */
 import { useState } from 'react';
-import { OUTPUT_OPTS } from '../App';
+
+import { OUTPUT_OPTS } from '../lib/formats';
+import { cx, ui } from '../lib/ui';
 
 export default function VersionBanner({ sourceChanged, results, onRegenerate, regenLoading }) {
-  const [selected, setSelected] = useState(() => {
-    // Pre-select all formats that are currently in the result set
-    return (OUTPUT_OPTS.map(o => o.key).filter(k => results && k in results));
-  });
+  const available = OUTPUT_OPTS.filter((o) => results && o.key in results);
+  const [selected, setSelected] = useState(() => available.map((o) => o.key));
 
   if (!sourceChanged) return null;
 
-  const toggle = (key) => {
-    setSelected(prev =>
-      prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]
-    );
-  };
-
-  const availableFormats = OUTPUT_OPTS.filter(o => results && o.key in results);
+  const toggle = (key) =>
+    setSelected((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
 
   return (
-    <div className="version-banner" role="alert" aria-live="polite">
-      <div className="version-banner-header">
-        <span className="version-banner-icon">⚡</span>
-        <div className="version-banner-text">
-          <strong>Source changed</strong>
-          <span>Select which formats to regenerate with the updated source.</span>
+    <div className="mb-3 rounded-lg border border-accent/35 bg-accent-soft/60 p-3" role="alert" aria-live="polite">
+      <div className="flex items-start gap-2.5">
+        <span className="text-sm text-accent">⚡</span>
+        <div>
+          <p className="text-sm font-medium text-ink">Source changed</p>
+          <p className="text-xs text-ink-muted">Pick which formats to regenerate with the updated source.</p>
         </div>
       </div>
 
-      <div className="version-banner-formats">
-        {availableFormats.map(({ key, label }) => (
-          <button
-            key={key}
-            type="button"
-            className={`version-format-btn${selected.includes(key) ? ' version-format-btn--selected' : ''}`}
-            onClick={() => toggle(key)}
-            aria-pressed={selected.includes(key)}
-          >
-            {selected.includes(key) ? '✓ ' : ''}{label}
-          </button>
-        ))}
+      <div className="mt-2.5 flex flex-wrap gap-1.5">
+        {available.map(({ key, label }) => {
+          const on = selected.includes(key);
+          return (
+            <button
+              key={key}
+              type="button"
+              onClick={() => toggle(key)}
+              aria-pressed={on}
+              className={cx(
+                'rounded-full border px-2.5 py-1 text-xs font-medium transition',
+                on ? 'border-accent bg-accent text-on-accent' : 'border-line-strong text-ink-muted hover:text-ink'
+              )}
+            >
+              {on ? '✓ ' : ''}{label}
+            </button>
+          );
+        })}
       </div>
 
-      <div className="version-banner-actions">
+      <div className="mt-3 flex flex-wrap gap-2">
         <button
           type="button"
-          className="btn btn-primary btn-sm"
           onClick={() => onRegenerate(selected)}
           disabled={regenLoading || !selected.length}
+          className={cx(ui.btnBase, ui.btnPrimary, ui.sizeSm)}
         >
           {regenLoading ? 'Regenerating…' : `Regenerate ${selected.length} format${selected.length !== 1 ? 's' : ''}`}
         </button>
         <button
           type="button"
-          className="btn btn-ghost btn-sm"
-          onClick={() => onRegenerate(availableFormats.map(o => o.key))}
+          onClick={() => onRegenerate(available.map((o) => o.key))}
           disabled={regenLoading}
+          className={cx(ui.btnBase, ui.btnGhost, ui.sizeSm)}
         >
           Regenerate all
         </button>

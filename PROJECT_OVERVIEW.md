@@ -19,9 +19,9 @@ The system allows instant copying, direct presentation export to PowerPoint (`.p
 
 ## Architectural Components
 
-### 1. React / Vite Frontend (`gen-ai-content-engine/frontend`)
+### 1. React / Vite / Tailwind Frontend (`gen-ai-content-engine/frontend`)
 
-- **Modern Architecture**: Clean, authentication-free dashboard providing immediate access to the transformation workspace.
+- **Modern Architecture**: React 19 + Vite + Tailwind CSS v4. A Firebase Auth gate (email/password + Google) fronts the transformation workspace.
 - **Source Ingestion Tabs**:
   - Raw Text: Paste plain text or articles.
   - File Upload: Drag-and-drop or browse `.pdf`, `.docx`, and `.txt` files up to 10 MB.
@@ -30,7 +30,7 @@ The system allows instant copying, direct presentation export to PowerPoint (`.p
 - **Output Format Matrix**: Multi-select format picker for the 5 specialized formats.
 - **Results Workspace**: Side-by-side tabbed viewer showing generated outputs, claim verification badges, individual unsupported claim flags, copy actions, and format-specific download triggers (PPTX / PDF).
 - **History Drawer**: Slide-out panel to browse previous transformation runs from MongoDB, inspect metadata, and load full outputs without re-running generation.
-- **Aesthetics**: Polished dark theme with subtle grid and animated wave backgrounds, refined typography, and smooth micro-interactions.
+- **Aesthetics**: Tailwind CSS v4 design system — dark, professional palette with an indigo accent, hairline-bordered panels, a soft radial backdrop, and calm entrance transitions.
 
 ### 2. FastAPI Backend (`gen-ai-content-engine/backend/main.py`)
 
@@ -44,12 +44,19 @@ The system allows instant copying, direct presentation export to PowerPoint (`.p
   - Orchestrated asynchronously using `asyncio.gather(..., return_exceptions=True)` for fault tolerance and low response latency.
 - **Claim-Level Anti-Hallucination Verification Engine**:
   - Evaluates generated statements against the ground-truth normalized source.
-  - Returns verification status (`verified`, `has_unsupported_claims`, `unverified`), confidence score, and specific unsupported claims with rationales.
+  - Flags specific unsupported claims with rationales (shown inline, not removed).
+- **Tamper-Evident Integrity Engine**:
+  - SHA-256 fingerprint per output at generation time (`hash` / `hash_algo`) plus a combined `run_hash` over the whole run.
+  - `POST /verify` (and `GET /verify/{run_id}/{format}`) re-hash content against the recorded fingerprint; the UI surfaces a live pass/fail and an editable "tamper test".
 - **Export Endpoints**:
   - `/export/pptx`: Generates formatted multi-slide PowerPoint files using `python-pptx`.
   - `/export/pdf`: Generates clean printable PDF summaries using `reportlab`.
 - **Persistence Layer**:
-  - MongoDB integration (Atlas or local) with automatic fallback if database is unavailable.
-  - Audit logging of full run history, inputs, outputs, and verification results.
-- **LLM Provider Abstraction**:
-  - Pluggable provider architecture with `GroqAdapter` (using `llama-3.3-70b-versatile` with automatic fallback to `llama3-8b-8192`) and `OllamaAdapter` stub for local LLM inference.
+  - Supabase (Postgres) via `supabase-py`, with a local-JSON fallback (`backend/.local_history.json`) when unconfigured.
+  - Per-user run history (scoped by Firebase UID): inputs, outputs, ground truth, and verification results.
+- **Authentication**:
+  - Firebase Authentication. Frontend uses the Firebase Web SDK (email/password + Google). Backend verifies ID tokens with `firebase-admin` when a service account is present, otherwise with `google-auth` against Google's public keys using just `FIREBASE_PROJECT_ID`. Dev-bypass until any Firebase config is set; `AUTH_REQUIRED=true` hard-enforces.
+- **Per-Format Multi-Provider Routing**:
+  - Each selected format's generation agent runs on its assigned provider (`FORMAT_PROVIDER`, env-overridable via `LLM_FORMAT_*`): LinkedIn / X-thread → Groq; Advisory / Executive Summary / Presentation / Infographic → Gemini. Same source input for all.
+  - Shared passes (ground-truth, verify, consistency, diff) task-routed to Gemini via `get_llm_for(task)`.
+  - `_RoutedLLM` does automatic cross-provider fallback and records `served_by`; results carry `provider: {assigned, served_by}`. `OllamaAdapter` stub retained for offline/on-prem.

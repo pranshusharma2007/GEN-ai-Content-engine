@@ -8,40 +8,30 @@ import ResultsWorkspace   from './components/ResultsWorkspace';
 import Toast              from './components/Toast';
 import AnimatedContent    from './components/AnimatedContent';
 import HistoryDrawer      from './components/HistoryDrawer';
+import { apiFetch, apiJson } from './lib/api';
+import { useAuth } from './context/AuthContext';
+import { cx } from './lib/ui';
+import { saveBlob } from './lib/download';
+import { OUTPUT_OPTS, TONES, AUDIENCES } from './lib/formats';
 
-import './App.css';
-
-const GW_URL = import.meta.env.VITE_GEN_AI_API_URL || 'http://localhost:8000';
-
-// Format keys must match backend SUPPORTED_FORMATS
-export const OUTPUT_OPTS = [
-  { key: 'advisory',           label: 'Advisory' },
-  { key: 'executive_summary',  label: 'Executive Summary' },
-  { key: 'linkedin',           label: 'LinkedIn Post' },
-  { key: 'x_thread',           label: 'X / Twitter Thread' },
-  { key: 'presentation',       label: 'Presentation' },
-  { key: 'infographic',        label: 'Infographic' },
-];
-
-const TONES = [
-  'Professional',
-  'Authoritative & Strategic',
-  'Casual & Engaging',
-  'Urgent & Action-Oriented',
-  'Inspirational',
-];
-
-const AUDIENCES = [
-  'Leadership / Execs',
-  'General Public',
-  'Tech / Developers',
-  'Sales / Marketing',
-  'Stakeholders & Investors',
-];
+/** Titled panel wrapper used by the workspace form. */
+function Section({ id, title, helper, children }) {
+  return (
+    <section className="rounded-xl border border-line bg-surface shadow-panel" aria-labelledby={id}>
+      <div className="border-b border-line px-5 py-3.5">
+        <h2 id={id} className="text-sm font-semibold text-ink">{title}</h2>
+        {helper && <p className="mt-0.5 text-xs text-ink-muted">{helper}</p>}
+      </div>
+      <div className="p-5">{children}</div>
+    </section>
+  );
+}
 
 const LOADING_STEP_INTERVAL_MS = 2500;
 
 export default function App() {
+  const { user, signOutUser } = useAuth();
+
   // ── Source state ──────────────────────────────────────────────
   const [sourceType, setSourceType] = useState('text'); // 'text' | 'file' | 'url'
   const [text,       setText]       = useState('');
@@ -69,7 +59,6 @@ export default function App() {
   // ── Source versioning ─────────────────────────────────────────
   const [loadedRunSource, setLoadedRunSource] = useState(null); // source text of loaded history run
   const [sourceChanged,   setSourceChanged]   = useState(false);
-  const [affectedFormats, setAffectedFormats] = useState([]);
   const [regenLoading,    setRegenLoading]    = useState(false);
 
   // ── History ───────────────────────────────────────────────────
@@ -81,7 +70,18 @@ export default function App() {
   const [copied,       setCopied]       = useState('');
   const [toastVisible, setToastVisible] = useState('');
 
+  // ── Backend config (per-format LLM routing) ──────────────────
+  const [formatRouting, setFormatRouting] = useState({});
+
   const stepTimerRef = useRef(null);
+
+  // ── Fetch backend routing once (unauthenticated /health) ──────
+  useEffect(() => {
+    fetch(`${import.meta.env.VITE_GEN_AI_API_URL || 'http://localhost:8000'}/health`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => d?.format_routing && setFormatRouting(d.format_routing))
+      .catch(() => {});
+  }, []);
 
   // ── Loading step cycling ──────────────────────────────────────
   useEffect(() => {
@@ -99,9 +99,7 @@ export default function App() {
   const openHistory = async () => {
     setHistoryError('');
     try {
-      const res  = await fetch(`${GW_URL}/history`);
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || `Unable to load history (${res.status}).`);
+      const data = await apiJson('/history');
       setHistory(data.history || []);
     } catch (err) {
       setHistoryError(err.message || 'Unable to load history.');
@@ -114,16 +112,14 @@ export default function App() {
     setShowHistory(false);
     setEngineErr('');
     setSourceChanged(false);
-    setAffectedFormats([]);
     try {
-      const res  = await fetch(`${GW_URL}/history/${encodeURIComponent(item.run_id)}`);
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || 'Could not load this run.');
+      const data = await apiJson(`/history/${encodeURIComponent(item.run_id)}`);
       setResult({
         run_id:        data.run_id,
         results:       data.results || {},
         consistency:   data.consistency || null,
         ground_truth:  data.ground_truth || null,
+        integrity:     data.integrity || null,
       });
       if (data.parameters) {
         setTone(data.parameters.tone || 'Professional');
@@ -149,7 +145,6 @@ export default function App() {
     setShowHistory(false);
     setLoadedRunSource(null);
     setSourceChanged(false);
-    setAffectedFormats([]);
   };
 
   // ── Source change detection ────────────────────────────────────
@@ -166,7 +161,7 @@ export default function App() {
     setRegenLoading(true);
     setEngineErr('');
     try {
-      const res = await fetch(`${GW_URL}/regenerate`, {
+      const data = await apiJson('/regenerate', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -177,22 +172,30 @@ export default function App() {
           audience,
         }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || 'Regeneration failed.');
       setResult({
         run_id:       data.run_id,
         results:      data.results || {},
         consistency:  data.consistency || null,
         ground_truth: data.ground_truth || null,
+        integrity:    data.integrity || null,
       });
       setLoadedRunSource(text);
       setSourceChanged(false);
-      setAffectedFormats([]);
     } catch (err) {
       setEngineErr(err.message);
     } finally {
       setRegenLoading(false);
     }
+  };
+
+  // ── Integrity verification ───────────────────────────────────
+  const handleVerify = async (formatKey, content) => {
+    if (!result?.run_id) throw new Error('No run to verify against.');
+    return apiJson('/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: result.run_id, format_name: formatKey, content }),
+    });
   };
 
   // ── Transform handler ─────────────────────────────────────────
@@ -234,7 +237,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch(`${GW_URL}/transform`, {
+      const res = await apiFetch('/transform', {
         method: 'POST',
         body:   fd,
       });
@@ -250,6 +253,7 @@ export default function App() {
         results:      data.results,
         consistency:  data.consistency || null,
         ground_truth: data.ground_truth || null,
+        integrity:    data.integrity || null,
       });
       setLoadedRunSource(null);
       setSourceChanged(false);
@@ -278,19 +282,18 @@ export default function App() {
   // ── Download PPTX ─────────────────────────────────────────────
   const handleDownloadPptx = async (content) => {
     try {
-      const res = await fetch(`${GW_URL}/export/pptx`, {
+      const res = await apiFetch('/export/pptx', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content, title: 'OmniFormat Presentation' }),
       });
-      if (!res.ok) throw new Error('PPTX generation failed.');
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'PPTX generation failed.');
+      }
       const blob = await res.blob();
-      const href = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = href;
-      a.download = 'omniformat-presentation.pptx';
-      a.click();
-      URL.revokeObjectURL(href);
+      if (blob.size < 1000) throw new Error('PPTX came back empty — check the backend logs.');
+      saveBlob(blob, 'omniformat-presentation.pptx');
       setToastVisible('PPTX downloaded');
       setTimeout(() => setToastVisible(''), 2000);
     } catch (err) {
@@ -301,19 +304,18 @@ export default function App() {
   // ── Download PDF ──────────────────────────────────────────────
   const handleDownloadPdf = async (content, formatLabel) => {
     try {
-      const res = await fetch(`${GW_URL}/export/pdf`, {
+      const res = await apiFetch('/export/pdf', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content, format_name: formatLabel }),
       });
-      if (!res.ok) throw new Error('PDF generation failed.');
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'PDF generation failed.');
+      }
       const blob = await res.blob();
-      const href = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = href;
-      a.download = `omniformat-${formatLabel.toLowerCase().replace(/\s+/g, '-')}.pdf`;
-      a.click();
-      URL.revokeObjectURL(href);
+      if (blob.size < 500) throw new Error('PDF came back empty — check the backend logs.');
+      saveBlob(blob, `omniformat-${formatLabel.toLowerCase().replace(/\s+/g, '-')}.pdf`);
       setToastVisible('PDF downloaded');
       setTimeout(() => setToastVisible(''), 2000);
     } catch (err) {
@@ -321,16 +323,22 @@ export default function App() {
     }
   };
 
-  const canGenerate =
-    (
-      (sourceType === 'text' && text.trim()) ||
-      (sourceType === 'file' && file) ||
-      (sourceType === 'url'  && url.trim())
-    ) && Object.values(outputs).some(Boolean);
+  const hasSource =
+    (sourceType === 'text' && text.trim()) ||
+    (sourceType === 'file' && file) ||
+    (sourceType === 'url'  && url.trim());
+
+  const canGenerate = !!hasSource && Object.values(outputs).some(Boolean);
+  const step = loading || result ? 2 : canGenerate ? 2 : hasSource ? 1 : 0;
 
   // ── Render ────────────────────────────────────────────────────
   return (
-    <AppShell onHistory={openHistory} onNewWorkspace={newWorkspace}>
+    <AppShell
+      onHistory={openHistory}
+      onNewWorkspace={newWorkspace}
+      user={user}
+      onSignOut={signOutUser}
+    >
       <HistoryDrawer
         isOpen={showHistory}
         onClose={() => setShowHistory(false)}
@@ -339,33 +347,53 @@ export default function App() {
         onSelect={selectHistory}
       />
 
-      <div className="workspace">
-        {/* Top bar */}
-        <AnimatedContent><header className="workspace-topbar">
-          <div className="eyebrow">OMNIFORMAT AI / WORKSPACE</div>
-          <h1 className="workspace-title">Content Engine</h1>
-          <p className="workspace-subtitle">
-            Transform any source into advisory, summaries, social posts, and presentations — simultaneously.
-          </p>
-          <div className="progress" aria-label="Creation progress">
-            <span className="progress-step progress-step--current"><b>01</b> Source material</span>
-            <span className="progress-rule" />
-            <span className="progress-step"><b>02</b> Select formats</span>
-            <span className="progress-rule" />
-            <span className="progress-step"><b>03</b> Generate</span>
-          </div>
-        </header></AnimatedContent>
+      <div className="mx-auto w-full max-w-5xl overflow-x-hidden px-5 pb-24 pt-8 sm:px-8">
+        {/* Header */}
+        <AnimatedContent>
+          <header className="mb-8">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">
+              OmniFormat AI · Workspace
+            </p>
+            <h1 className="mt-2 text-2xl font-semibold tracking-tight text-ink sm:text-[28px]">
+              Content Transformation Engine
+            </h1>
+            <p className="mt-2 max-w-2xl text-sm leading-relaxed text-ink-muted">
+              Turn one source document into an advisory, executive summary, social posts, a deck
+              and an infographic — generated in parallel, every claim checked against the source.
+            </p>
 
-        {/* Main content */}
-        <main className="workspace-main">
-          <form className="workspace-form" onSubmit={transform} noValidate>
+            <ol className="mt-6 flex flex-wrap items-center gap-x-3 gap-y-2 text-xs">
+              {[
+                ['01', 'Source material', step >= 0],
+                ['02', 'Select formats', step >= 1],
+                ['03', 'Generate', step >= 2],
+              ].map(([n, label, done], i) => (
+                <li key={n} className="flex items-center gap-3">
+                  {i > 0 && <span className="hidden h-px w-6 bg-line sm:block" aria-hidden="true" />}
+                  <span className={cx('flex items-center gap-2 whitespace-nowrap', done ? 'text-ink' : 'text-ink-subtle')}>
+                    <span
+                      className={cx(
+                        'grid h-5 w-5 place-items-center rounded-full border text-[10px] font-semibold',
+                        done ? 'border-accent bg-accent-soft text-accent' : 'border-line text-ink-subtle'
+                      )}
+                    >
+                      {n}
+                    </span>
+                    {label}
+                  </span>
+                </li>
+              ))}
+            </ol>
+          </header>
+        </AnimatedContent>
 
-            {/* Source content */}
-            <AnimatedContent><section className="workspace-section" aria-labelledby="lbl-source">
-              <div className="section-heading"><div>
-                <span className="workspace-section-label" id="lbl-source">Source material</span>
-                <p className="section-helper">Paste text, upload a PDF or DOCX, or enter a URL.</p>
-              </div></div>
+        <form className="space-y-5" onSubmit={transform} noValidate>
+          <AnimatedContent>
+            <Section
+              id="lbl-source"
+              title="Source material"
+              helper="Paste text, upload a PDF / DOCX / TXT, or enter a URL."
+            >
               <SourceInput
                 sourceType={sourceType}
                 onSourceTypeChange={setSourceType}
@@ -376,56 +404,57 @@ export default function App() {
                 url={url}
                 onUrlChange={setUrl}
               />
-            </section></AnimatedContent>
+            </Section>
+          </AnimatedContent>
 
-            {/* Output formats */}
-            <AnimatedContent><section className="workspace-section" aria-labelledby="lbl-formats">
-              <div className="section-heading"><div>
-                <span className="workspace-section-label" id="lbl-formats">Output formats</span>
-                <p className="section-helper">Agents run in parallel — select any combination.</p>
-              </div></div>
+          <AnimatedContent>
+            <Section
+              id="lbl-formats"
+              title="Output formats"
+              helper="Each format is a separate specialised agent — they run concurrently."
+            >
               <OutputSelector
                 outputs={outputs}
                 onToggle={(key) => setOutputs((o) => ({ ...o, [key]: !o[key] }))}
                 onToggleAll={setAllOutputs}
                 options={OUTPUT_OPTS}
+                routing={formatRouting}
               />
-            </section></AnimatedContent>
+            </Section>
+          </AnimatedContent>
 
-            {/* Tone, audience, submit */}
-            <GenerationControls
-              tone={tone}           onToneChange={setTone}
-              audience={audience}   onAudienceChange={setAudience}
-              tones={TONES}         audiences={AUDIENCES}
-              loading={loading}
-              loadingStep={loadingStep}
-              error={engineErr}
-              canGenerate={canGenerate}
+          <GenerationControls
+            tone={tone}           onToneChange={setTone}
+            audience={audience}   onAudienceChange={setAudience}
+            tones={TONES}         audiences={AUDIENCES}
+            loading={loading}
+            loadingStep={loadingStep}
+            error={engineErr}
+            canGenerate={canGenerate}
+          />
+        </form>
+
+        {result && (
+          <section className="mt-8" aria-labelledby="lbl-results">
+            <h2 id="lbl-results" className="mb-3 text-[11px] font-semibold uppercase tracking-[0.16em] text-ink-subtle">
+              Results
+            </h2>
+            <ResultsWorkspace
+              runId={result.run_id}
+              results={result.results}
+              consistency={result.consistency}
+              integrity={result.integrity}
+              sourceChanged={sourceChanged}
+              onRegenerate={handleRegenerate}
+              regenLoading={regenLoading}
+              onCopy={handleCopy}
+              copied={copied}
+              onVerify={handleVerify}
+              onDownloadPptx={handleDownloadPptx}
+              onDownloadPdf={handleDownloadPdf}
             />
-
-          </form>
-
-          {/* Results */}
-          {result && (
-            <section
-              className="workspace-section workspace-section--results"
-              aria-labelledby="lbl-results"
-            >
-              <span className="workspace-section-label" id="lbl-results">Results</span>
-              <ResultsWorkspace
-                results={result.results}
-                consistency={result.consistency}
-                sourceChanged={sourceChanged}
-                onRegenerate={handleRegenerate}
-                regenLoading={regenLoading}
-                onCopy={handleCopy}
-                copied={copied}
-                onDownloadPptx={handleDownloadPptx}
-                onDownloadPdf={handleDownloadPdf}
-              />
-            </section>
-          )}
-        </main>
+          </section>
+        )}
       </div>
 
       <Toast message={toastVisible} visible={!!toastVisible} />

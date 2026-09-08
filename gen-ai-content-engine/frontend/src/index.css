@@ -1,3 +1,5 @@
+@import 'tailwindcss';
+
 @font-face {
   font-family: 'Geist Sans';
   src: url('./assets/Geist-Variable.woff2') format('woff2');
@@ -6,8 +8,114 @@
   font-display: swap;
 }
 
-/* Prevent FOUC — base background/color before React mounts */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { scroll-behavior: smooth; }
-body { background: #0A0B0D; color: #E6E8EB; margin: 0; }
-#root { min-height: 100vh; display: flex; flex-direction: column; }
+/* ═══════════════════════════════════════════════════════════════
+   Design tokens → Tailwind utilities
+   colours:  bg-canvas / bg-surface / text-ink / border-line / text-accent …
+   shadows:  shadow-panel / shadow-pop
+   ═══════════════════════════════════════════════════════════════ */
+@theme {
+  --font-sans: 'Geist Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Code', 'Consolas', monospace;
+
+  /* Surfaces — near-black with a cool cast */
+  --color-canvas: #0a0b0f;
+  --color-surface: #12151c;
+  --color-surface-2: #191d26;
+  --color-elevated: #232935;
+  --color-inset: #0c0e13;
+
+  /* Hairline borders */
+  --color-line: #2b313d;
+  --color-line-strong: #3b4350;
+
+  /* Text */
+  --color-ink: #e8eaed;
+  --color-ink-muted: #9aa3b2;
+  --color-ink-subtle: #626b7a;
+
+  /* Primary — professional indigo */
+  --color-accent: #6366f1;
+  --color-accent-hover: #7c7ff5;
+  --color-accent-press: #5457e0;
+  --color-accent-soft: #6366f124;
+  --color-accent-ring: #6366f166;
+  --color-on-accent: #ffffff;
+
+  /* Semantic */
+  --color-success: #34d399;
+  --color-success-soft: #34d3991f;
+  --color-warning: #fbbf24;
+  --color-warning-soft: #fbbf241f;
+  --color-danger: #f87171;
+  --color-danger-soft: #f871711f;
+  --color-info: #60a5fa;
+
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  --shadow-pop: 0 12px 40px -12px rgba(0, 0, 0, 0.65);
+}
+
+/* ── Base ──────────────────────────────────────────────────────────
+   NOTE: Tailwind's Preflight (in @layer base) already resets margin,
+   padding and box-sizing. Do NOT add an unlayered `* {}` reset here —
+   unlayered rules beat @layer utilities and would kill p-*/m-*/space-*. */
+@layer base {
+  html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+
+  body {
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
+  }
+
+  #root { min-height: 100vh; display: flex; flex-direction: column; }
+
+  ::selection { background: var(--color-accent-soft); color: var(--color-ink); }
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-line-strong); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-ink-subtle); }
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Motion ────────────────────────────────────────────────────── */
+@keyframes omni-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes omni-shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position: 400px 0; }
+}
+@keyframes omni-pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.3; }
+}
+
+.animated-content { animation: omni-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both; }
+
+.omni-skeleton {
+  background: linear-gradient(90deg, var(--color-surface-2) 0px, var(--color-elevated) 120px, var(--color-surface-2) 240px);
+  background-size: 800px 100%;
+  animation: omni-shimmer 1.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Native <select> option colours on dark backgrounds */
+select.omni-select option { background: var(--color-surface-2); color: var(--color-ink); }

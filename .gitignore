@@ -8,3 +8,6 @@
 *.log
 **/*.sqlite3
 **/chat_history.json
+**/.local_history.json
+**/.env.local
+**/*serviceAccount*.json
