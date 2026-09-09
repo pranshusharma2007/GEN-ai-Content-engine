@@ -4,7 +4,7 @@ SIH26154 · Team WildCard
 
 Architecture:
   source → normalize_source() → extract_ground_truth() → 6 parallel agents
-        → verify_claims() → check_cross_format_consistency() → MongoDB → response
+        → verify_claims() → check_cross_format_consistency() → storage (Supabase) → response
 
 Formats: advisory, executive_summary, linkedin, x_thread, presentation, infographic
 """
@@ -12,6 +12,7 @@ Formats: advisory, executive_summary, linkedin, x_thread, presentation, infograp
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import ipaddress
 import json
@@ -21,6 +22,7 @@ import textwrap
 import uuid
 import zipfile
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -33,10 +35,12 @@ _env_path = Path(__file__).parent.parent.parent / ".env"
 load_dotenv(dotenv_path=_env_path)
 load_dotenv()  # local fallback
 
-from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 from starlette.concurrency import run_in_threadpool
+
+from auth import get_current_user
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 FRONTEND_ORIGINS = [
@@ -48,9 +52,34 @@ FRONTEND_ORIGINS = [
 ]
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-MONGODB_URI = os.environ.get("MONGODB_URI", "")
-MONGODB_DATABASE = os.environ.get("MONGODB_DATABASE", "omniformat_ai")
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+# Gemini "flash" models reason by default; for these structured tasks that is pure
+# latency. 0 = thinking off. Raise (e.g. 512) only if output quality needs it.
+GEMINI_THINKING_BUDGET = int(os.environ.get("GEMINI_THINKING_BUDGET", "0"))
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq")  # default provider for generation
+
+# Task → preferred provider for the shared analysis passes (not per-format generation).
+# Default to Groq for these — they run in series around the parallel agents, so
+# latency here is on the critical path. Each falls back to the other on failure.
+TASK_PROVIDER = {
+    "ground_truth": os.environ.get("LLM_TASK_GROUND_TRUTH", "groq"),
+    "verify": os.environ.get("LLM_TASK_VERIFY", "groq"),
+    "consistency": os.environ.get("LLM_TASK_CONSISTENCY", "groq"),
+    "diff": os.environ.get("LLM_TASK_DIFF", "groq"),
+}
+
+# Per-format generation routing. Each selected format's agent runs on its assigned
+# provider; the source input is identical for all. Override any of these via env.
+# MVP providers: "groq" | "gemini" (falls back to the other if the primary fails).
+FORMAT_PROVIDER = {
+    "advisory":          os.environ.get("LLM_FORMAT_ADVISORY", "gemini"),
+    "executive_summary": os.environ.get("LLM_FORMAT_EXECUTIVE_SUMMARY", "gemini"),
+    "linkedin":          os.environ.get("LLM_FORMAT_LINKEDIN", "groq"),
+    "x_thread":          os.environ.get("LLM_FORMAT_X_THREAD", "groq"),
+    "presentation":      os.environ.get("LLM_FORMAT_PRESENTATION", "gemini"),
+    "infographic":       os.environ.get("LLM_FORMAT_INFOGRAPHIC", "gemini"),
+}
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_SOURCE_CHARS = 120_000
@@ -79,7 +108,22 @@ SUPPORTED_FORMATS = {
 }
 
 # ── FastAPI app ───────────────────────────────────────────────────────────────
-app = FastAPI(title="OmniFormat AI Engine", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: "FastAPI"):
+    providers = _available_providers()
+    if not providers:
+        print("[WARN] No LLM provider configured (set GROQ_API_KEY and/or GEMINI_API_KEY).")
+    else:
+        print(f"[OmniFormat] LLM providers: {providers}")
+        print(f"[OmniFormat] Per-format routing: {FORMAT_PROVIDER}")
+        print(f"[OmniFormat] Task routing: {TASK_PROVIDER}")
+    print(f"[OmniFormat] History backend: {storage.backend_label()}")
+    print("[OmniFormat] Backend started.")
+    yield
+
+
+app = FastAPI(title="OmniFormat AI Engine", version="2.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,8 +145,17 @@ class LLMProvider(ABC):
         """Synchronous chat completion. Returns response text."""
 
 
+def _retry_after_seconds(message: str, default: float = 2.0) -> float:
+    """Pull 'try again in 1.2s' / 'retry after 3' hints out of a rate-limit message."""
+    m = re.search(r"(?:try again in|retry after)\s+([\d.]+)\s*(ms|s)?", message, re.I)
+    if not m:
+        return default
+    val = float(m.group(1))
+    return val / 1000.0 if (m.group(2) or "").lower() == "ms" else val
+
+
 class GroqAdapter(LLMProvider):
-    """Groq-hosted LLM adapter with intelligent model discovery and fallback."""
+    """Groq-hosted LLM adapter with model discovery, 429 backoff, and fallback."""
 
     CANDIDATE_MODELS = [
         "openai/gpt-oss-120b",
@@ -131,22 +184,73 @@ class GroqAdapter(LLMProvider):
             self._models = list(self.CANDIDATE_MODELS)
 
     def chat(self, system: str, user: str, temperature: float = 0.7) -> str:
+        import time as _time
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
         last_err = None
         for model in self._models:
-            try:
-                resp = self._client.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    model=model,
-                    temperature=temperature,
-                )
-                return resp.choices[0].message.content or ""
-            except Exception as exc:
-                print(f"[GroqAdapter] model={model} failed: {exc}")
-                last_err = exc
+            for attempt in range(3):  # one model, up to 3 tries (429 backoff)
+                try:
+                    resp = self._client.chat.completions.create(
+                        messages=messages, model=model, temperature=temperature,
+                    )
+                    return resp.choices[0].message.content or ""
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    msg = str(exc)
+                    is_rate = "429" in msg or "rate_limit" in msg.lower()
+                    if is_rate and attempt < 2:
+                        wait = _retry_after_seconds(msg, default=2.0 * (attempt + 1))
+                        print(f"[GroqAdapter] {model} rate-limited; retrying in {wait:.1f}s")
+                        _time.sleep(min(wait, 8.0))
+                        continue
+                    print(f"[GroqAdapter] model={model} failed: {exc}")
+                    break  # move to next model
         raise RuntimeError(f"All Groq models failed. Last error: {last_err}")
+
+
+class GeminiAdapter(LLMProvider):
+    """Google Gemini adapter (google-genai SDK)."""
+
+    def __init__(self, api_key: str, model: str = GEMINI_MODEL) -> None:
+        from google import genai
+        from google.genai import types
+
+        timeout_ms = int(os.environ.get("GEMINI_TIMEOUT_MS", "30000"))
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=timeout_ms),
+        )
+        self._model = model
+
+    def chat(self, system: str, user: str, temperature: float = 0.7) -> str:
+        from google.genai import types
+
+        cfg = dict(
+            system_instruction=system,
+            temperature=temperature,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            thinking_config=types.ThinkingConfig(thinking_budget=GEMINI_THINKING_BUDGET),
+        )
+        try:
+            resp = self._client.models.generate_content(
+                model=self._model, contents=user,
+                config=types.GenerateContentConfig(**cfg),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Only retry when the *thinking knob* is the problem; let timeouts /
+            # auth / quota errors propagate fast so _RoutedLLM can fall back.
+            if "thinking" not in str(exc).lower():
+                raise
+            cfg.pop("thinking_config", None)
+            resp = self._client.models.generate_content(
+                model=self._model, contents=user,
+                config=types.GenerateContentConfig(**cfg),
+            )
+        return getattr(resp, "text", "") or ""
 
 
 class OllamaAdapter(LLMProvider):
@@ -163,51 +267,105 @@ class OllamaAdapter(LLMProvider):
         )
 
 
-def _build_provider() -> LLMProvider:
-    provider = LLM_PROVIDER.lower()
-    if provider == "groq":
-        if not GROQ_API_KEY:
-            raise RuntimeError("GROQ_API_KEY is required when LLM_PROVIDER=groq")
-        return GroqAdapter(api_key=GROQ_API_KEY)
-    if provider == "ollama":
-        return OllamaAdapter()
-    raise RuntimeError(f"Unknown LLM_PROVIDER: {provider!r}")
+# ── Provider registry + task router ──────────────────────────────────────────
+
+_ADAPTERS: dict[str, Optional[LLMProvider]] = {}
 
 
-_llm: Optional[LLMProvider] = None
+def _get_adapter(name: str) -> Optional[LLMProvider]:
+    """Lazily build and cache one provider adapter. Returns None if unconfigured."""
+    name = name.lower()
+    if name in _ADAPTERS:
+        return _ADAPTERS[name]
+    adapter: Optional[LLMProvider] = None
+    try:
+        if name == "groq" and GROQ_API_KEY:
+            adapter = GroqAdapter(api_key=GROQ_API_KEY)
+        elif name == "gemini" and GEMINI_API_KEY:
+            adapter = GeminiAdapter(api_key=GEMINI_API_KEY)
+        elif name == "ollama":
+            adapter = OllamaAdapter()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[LLM] Failed to build adapter {name!r}: {exc}")
+        adapter = None
+    _ADAPTERS[name] = adapter
+    return adapter
+
+
+def _available_providers() -> list[str]:
+    out = []
+    if GROQ_API_KEY:
+        out.append("groq")
+    if GEMINI_API_KEY:
+        out.append("gemini")
+    return out
+
+
+class _RoutedLLM(LLMProvider):
+    """Sends to a preferred provider, with automatic fallback to any other
+    configured provider if the primary call fails. `last_provider` records which
+    provider actually served the most recent call."""
+
+    def __init__(self, preferred: str, label: str) -> None:
+        self._label = label
+        preferred = (preferred or LLM_PROVIDER).lower()
+        order = [preferred] + [p for p in ("groq", "gemini") if p != preferred]
+        self._order = [p for p in order if p in _available_providers()]
+        self.last_provider: Optional[str] = None
+
+    @property
+    def preferred(self) -> Optional[str]:
+        return self._order[0] if self._order else None
+
+    def chat(self, system: str, user: str, temperature: float = 0.7) -> str:
+        if not self._order:
+            raise RuntimeError(
+                "No LLM provider configured. Set GROQ_API_KEY and/or GEMINI_API_KEY."
+            )
+        last_err: Optional[Exception] = None
+        for name in self._order:
+            adapter = _get_adapter(name)
+            if adapter is None:
+                continue
+            try:
+                out = adapter.chat(system, user, temperature)
+                self.last_provider = name
+                return out
+            except Exception as exc:  # noqa: BLE001
+                print(f"[LLM:{self._label}] provider={name} failed: {exc}")
+                last_err = exc
+        raise RuntimeError(f"All providers failed for {self._label!r}. Last error: {last_err}")
+
+
+_ROUTED: dict[str, _RoutedLLM] = {}
+
+
+def get_llm_for(task: str) -> LLMProvider:
+    """Task-routed LLM for the shared analysis passes (ground_truth | verify | consistency | diff)."""
+    key = f"task:{task}"
+    if key not in _ROUTED:
+        _ROUTED[key] = _RoutedLLM(TASK_PROVIDER.get(task, LLM_PROVIDER), task)
+    return _ROUTED[key]
+
+
+def get_llm_for_format(fmt: str) -> _RoutedLLM:
+    """Per-format generation LLM. Each selected format's agent runs on its assigned provider."""
+    key = f"fmt:{fmt}"
+    if key not in _ROUTED:
+        _ROUTED[key] = _RoutedLLM(FORMAT_PROVIDER.get(fmt, LLM_PROVIDER), f"gen:{fmt}")
+    return _ROUTED[key]
 
 
 def get_llm() -> LLMProvider:
-    global _llm
-    if _llm is None:
-        _llm = _build_provider()
-    return _llm
+    """Back-compat helper — the default provider."""
+    return _RoutedLLM(LLM_PROVIDER, "default")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MongoDB Client
+# History persistence — see storage.py (Supabase + local-JSON fallback)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_mongo_collection = None
-
-
-def _get_collection():
-    global _mongo_collection
-    if _mongo_collection is not None:
-        return _mongo_collection
-    if not MONGODB_URI:
-        print("[MongoDB] MONGODB_URI not set — history persistence disabled.")
-        return None
-    try:
-        from pymongo import MongoClient
-        client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-        db = client[MONGODB_DATABASE]
-        _mongo_collection = db["transformations"]
-        print("[MongoDB] Connected successfully.")
-        return _mongo_collection
-    except Exception as exc:
-        print(f"[MongoDB] Connection failed: {exc}")
-        return None
+import storage  # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -855,26 +1013,61 @@ def check_cross_format_consistency(results: dict, llm: LLMProvider) -> dict:
         return {"contradictions": [], "consistency_score": 100, "error": "Consistency check could not be completed."}
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tamper-Evident Integrity (SHA-256 hash-logging)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+HASH_ALGO = "sha256"
+
+
+def _sha256(text: str) -> str:
+    """SHA-256 hex digest of a string (UTF-8). Empty/None → hash of ''."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _run_fingerprint(run_id: str, created_at: str, results: dict) -> str:
+    """A single fingerprint over a whole run: run_id + timestamp + each format's
+    content hash, in a stable order. Any change to any output changes this."""
+    parts = [run_id or "", created_at or ""]
+    for fmt in sorted(results):
+        entry = results[fmt] or {}
+        parts.append(f"{fmt}:{entry.get('hash', '')}")
+    return _sha256("|".join(parts))
+
+
 async def _run_agent(
     fmt: str,
     source: str,
     tone: str,
     audience: str,
-    llm: LLMProvider,
     ground_truth: str = "",
 ) -> tuple[str, dict]:
-    """Run one generation agent + verification. Returns (format, result_dict)."""
+    """Run one generation agent (on its assigned provider) + verification.
+    Returns (format, result_dict). Same source input for every format."""
     fn = FORMAT_FN_MAP[fmt]
+    assigned = FORMAT_PROVIDER.get(fmt, LLM_PROVIDER)
     try:
-        gen_result = await run_in_threadpool(fn, source, tone, audience, llm, ground_truth)
+        gen_llm = get_llm_for_format(fmt)
+        gen_result = await run_in_threadpool(fn, source, tone, audience, gen_llm, ground_truth)
         content = gen_result.get("content", "")
         infographic_data = gen_result.get("_infographic_data")  # only for infographic
-        # Verify generated content against source
-        verification = await run_in_threadpool(verify_claims, source, content, llm)
+        # Verify generated content against source (task-routed — prefers Gemini)
+        verification = await run_in_threadpool(
+            verify_claims, source, content, get_llm_for("verify")
+        )
+        served_by = (
+            getattr(gen_llm, "last_provider", None)
+            or getattr(gen_llm, "preferred", None)
+            or assigned
+        )
         result: dict = {
             "status": "success",
             "content": content,
             "verification": verification,
+            "provider": {"assigned": assigned, "served_by": served_by},
+            # Fingerprint of the exact content string, recorded at generation time.
+            "hash": _sha256(content),
+            "hash_algo": HASH_ALGO,
         }
         if infographic_data is not None:
             result["infographic_data"] = infographic_data
@@ -886,6 +1079,7 @@ async def _run_agent(
             "error": str(exc),
             "content": None,
             "verification": None,
+            "provider": {"assigned": assigned, "served_by": None},
         }
 
 
@@ -894,12 +1088,14 @@ async def run_agents_concurrently(
     source: str,
     tone: str,
     audience: str,
-    llm: LLMProvider,
     ground_truth: str = "",
 ) -> dict:
-    """Run all selected format agents concurrently. One failure ≠ all fail."""
+    """Run each selected format's agent concurrently on its assigned provider.
+    Same source for all; one failure ≠ all fail."""
+    routing = {fmt: FORMAT_PROVIDER.get(fmt, LLM_PROVIDER) for fmt in formats}
+    print(f"[Agents] Per-format routing: {routing}")
     tasks = [
-        _run_agent(fmt, source, tone, audience, llm, ground_truth)
+        _run_agent(fmt, source, tone, audience, ground_truth)
         for fmt in formats
     ]
     results = await asyncio.gather(*tasks, return_exceptions=False)
@@ -907,67 +1103,30 @@ async def run_agents_concurrently(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# MongoDB Persistence
+# History Persistence (delegates to storage.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _save_to_mongo(document: dict) -> None:
-    col = _get_collection()
-    if col is None:
-        return
+def _save_run(document: dict) -> None:
     try:
-        col.insert_one(document)
-    except Exception as exc:
-        print(f"[MongoDB] Save failed: {exc}")
+        storage.save_run(document)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[storage] Save failed: {exc}")
 
 
-def _fetch_history(limit: int = 50) -> list[dict]:
-    col = _get_collection()
-    if col is None:
-        return []
+def _fetch_history(user_id: Optional[str] = None, limit: int = 50) -> list[dict]:
     try:
-        cursor = col.find(
-            {},
-            {
-                "_id": 0,
-                "run_id": 1,
-                "source.type": 1,
-                "source.preview": 1,
-                "parameters": 1,
-                "created_at": 1,
-                "consistency.consistency_score": 1,
-            },
-        ).sort("created_at", -1).limit(limit)
-        return list(cursor)
-    except Exception as exc:
-        print(f"[MongoDB] History fetch failed: {exc}")
+        return storage.fetch_history(user_id=user_id, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[storage] History fetch failed: {exc}")
         return []
 
 
-def _fetch_run(run_id: str) -> Optional[dict]:
-    col = _get_collection()
-    if col is None:
-        return None
+def _fetch_run(run_id: str, user_id: Optional[str] = None) -> Optional[dict]:
     try:
-        doc = col.find_one({"run_id": run_id}, {"_id": 0})
-        return doc
-    except Exception as exc:
-        print(f"[MongoDB] Fetch run failed: {exc}")
+        return storage.fetch_run(run_id, user_id=user_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[storage] Fetch run failed: {exc}")
         return None
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Startup check
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@app.on_event("startup")
-async def startup_event():
-    if not GROQ_API_KEY and LLM_PROVIDER == "groq":
-        print("[WARN] GROQ_API_KEY not set. Generation will fail.")
-    if not MONGODB_URI:
-        print("[WARN] MONGODB_URI not set. History persistence disabled.")
-    else:
-        await run_in_threadpool(_get_collection)
-    print("[OmniFormat] Backend started.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -981,9 +1140,11 @@ def health():
     return {
         "status": "ok",
         "service": "OmniFormat AI Engine",
-        "version": "2.0.0",
-        "llm_provider": LLM_PROVIDER,
-        "database": "connected" if MONGODB_URI else "disabled",
+        "version": "2.2.0",
+        "llm_providers": _available_providers(),
+        "format_routing": FORMAT_PROVIDER,
+        "task_routing": TASK_PROVIDER,
+        "database": storage.backend_label(),
     }
 
 
@@ -997,6 +1158,7 @@ async def transform_content(
     formats: Optional[str] = Form("[]"),
     tone: Optional[str] = Form("Professional"),
     audience: Optional[str] = Form("Leadership / Execs"),
+    user: dict = Depends(get_current_user),
 ):
     # ── Validate formats ──────────────────────────────────────────────────
     try:
@@ -1042,36 +1204,43 @@ async def transform_content(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    # ── Get LLM provider ──────────────────────────────────────────────────
-    try:
-        llm = get_llm()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    # ── LLM routing: per-format generation + task-routed analysis (with fallback) ──
+    if not _available_providers():
+        raise HTTPException(
+            status_code=503,
+            detail="No LLM provider configured. Set GROQ_API_KEY and/or GEMINI_API_KEY.",
+        )
 
     # ── Extract ground truth (single pass, injected into all agents) ──────
-    gt_dict = await run_in_threadpool(extract_ground_truth, normalized_source, llm)
+    gt_dict = await run_in_threadpool(
+        extract_ground_truth, normalized_source, get_llm_for("ground_truth")
+    )
     ground_truth_str = _format_ground_truth(gt_dict)
     print(f"[GroundTruth] Entities={len(gt_dict['entities'])} Facts={len(gt_dict['key_facts'])} Stats={len(gt_dict['statistics'])}")
 
-    # ── Run agents concurrently ───────────────────────────────────────────
+    # ── Run the selected format agents concurrently, each on its assigned provider ──
     results = await run_agents_concurrently(
         formats=fmt_list,
         source=normalized_source,
         tone=tone,
         audience=audience,
-        llm=llm,
         ground_truth=ground_truth_str,
     )
 
     # ── Cross-format consistency check ────────────────────────────────────
-    consistency = await run_in_threadpool(check_cross_format_consistency, results, llm)
+    consistency = await run_in_threadpool(
+        check_cross_format_consistency, results, get_llm_for("consistency")
+    )
     print(f"[Consistency] Score={consistency.get('consistency_score')} Contradictions={len(consistency.get('contradictions', []))}")
 
-    # ── Persist to MongoDB ────────────────────────────────────────────────
+    # ── Persist run ───────────────────────────────────────────────────────
     run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    run_hash = _run_fingerprint(run_id, created_at, results)
     preview = normalized_source[:300] + "..." if len(normalized_source) > 300 else normalized_source
     document = {
         "run_id": run_id,
+        "user_id": user.get("uid", "anonymous"),
         "source": {
             "type": source_type,
             "content": normalized_source[:50000],  # cap stored content
@@ -1086,9 +1255,10 @@ async def transform_content(
         "ground_truth": gt_dict,
         "consistency": consistency,
         "results": results,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "integrity": {"algo": HASH_ALGO, "run_hash": run_hash},
+        "created_at": created_at,
     }
-    await run_in_threadpool(_save_to_mongo, document)
+    await run_in_threadpool(_save_run, document)
 
     return {
         "run_id": run_id,
@@ -1099,30 +1269,87 @@ async def transform_content(
         "ground_truth": gt_dict,
         "consistency": consistency,
         "results": results,
+        "integrity": {"algo": HASH_ALGO, "run_hash": run_hash},
+        "created_at": created_at,
     }
 
 
 @app.get("/history")
 @app.get("/api/history")
-async def get_history():
-    entries = await run_in_threadpool(_fetch_history)
+async def get_history(user: dict = Depends(get_current_user)):
+    entries = await run_in_threadpool(_fetch_history, user.get("uid"))
     return {"history": entries}
 
 
 @app.get("/history/{run_id}")
 @app.get("/api/history/{run_id}")
-async def get_history_item(run_id: str):
-    doc = await run_in_threadpool(_fetch_run, run_id)
+async def get_history_item(run_id: str, user: dict = Depends(get_current_user)):
+    doc = await run_in_threadpool(_fetch_run, run_id, user.get("uid"))
     if not doc:
         raise HTTPException(status_code=404, detail="Run not found.")
     return doc
+
+
+# ── Tamper-Evident Integrity Verification ────────────────────────────────────
+
+def _verify_against_run(doc: Optional[dict], fmt: str, content: Optional[str]) -> dict:
+    """Compare a SHA-256 of `content` (or the stored content when omitted) against
+    the fingerprint recorded for `fmt` at generation time."""
+    if not doc:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    entry = (doc.get("results") or {}).get(fmt)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Format {fmt!r} not in this run.")
+    stored_hash = entry.get("hash")
+    if not stored_hash:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No integrity fingerprint was recorded for {fmt!r} (older run).",
+        )
+    check_content = entry.get("content", "") if content is None else content
+    computed_hash = _sha256(check_content)
+    return {
+        "run_id": doc.get("run_id"),
+        "format_name": fmt,
+        "algo": entry.get("hash_algo", HASH_ALGO),
+        "stored_hash": stored_hash,
+        "computed_hash": computed_hash,
+        "verified": computed_hash == stored_hash,
+        "recorded_at": doc.get("created_at"),
+        "checked_supplied_content": content is not None,
+    }
+
+
+@app.post("/verify")
+@app.post("/api/verify")
+async def verify_integrity(request: Request, user: dict = Depends(get_current_user)):
+    """Re-hash content and compare to the fingerprint recorded at generation time.
+    Body: { run_id, format_name, content? }. Omit `content` to check the stored copy."""
+    body = await request.json()
+    run_id = (body.get("run_id") or "").strip()
+    fmt = (body.get("format_name") or body.get("format") or "").strip()
+    content = body.get("content")
+    if not run_id or not fmt:
+        raise HTTPException(status_code=400, detail="run_id and format_name are required.")
+    doc = await run_in_threadpool(_fetch_run, run_id, user.get("uid"))
+    return _verify_against_run(doc, fmt, content)
+
+
+@app.get("/verify/{run_id}/{format_name}")
+@app.get("/api/verify/{run_id}/{format_name}")
+async def verify_integrity_stored(
+    run_id: str, format_name: str, user: dict = Depends(get_current_user)
+):
+    """Storage-integrity check: re-hash the stored content for one format."""
+    doc = await run_in_threadpool(_fetch_run, run_id, user.get("uid"))
+    return _verify_against_run(doc, format_name, None)
 
 
 # ── Source Version Comparison ─────────────────────────────────────────────────
 
 @app.post("/compare_versions")
 @app.post("/api/compare_versions")
-async def compare_versions(request: Request):
+async def compare_versions(request: Request, _user: dict = Depends(get_current_user)):
     """Compare two source versions and identify changed facts."""
     body = await request.json()
     source_v1 = (body.get("source_v1") or "").strip()
@@ -1130,10 +1357,9 @@ async def compare_versions(request: Request):
     if not source_v1 or not source_v2:
         raise HTTPException(status_code=400, detail="Both source_v1 and source_v2 are required.")
 
-    try:
-        llm = get_llm()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    if not _available_providers():
+        raise HTTPException(status_code=503, detail="No LLM provider configured.")
+    llm = get_llm_for("diff")
 
     _DIFF_SYSTEM = textwrap.dedent("""
         You are a source-change analyst. You will receive two versions of a source document.
@@ -1156,9 +1382,9 @@ async def compare_versions(request: Request):
         Output raw JSON only.
     """).strip()
 
-    user = f"SOURCE V1:\n{source_v1[:4000]}\n\nSOURCE V2:\n{source_v2[:4000]}\n\nAnalyze changes:"
+    user_prompt = f"SOURCE V1:\n{source_v1[:4000]}\n\nSOURCE V2:\n{source_v2[:4000]}\n\nAnalyze changes:"
     try:
-        raw = await run_in_threadpool(llm.chat, _DIFF_SYSTEM, user, 0.1)
+        raw = await run_in_threadpool(llm.chat, _DIFF_SYSTEM, user_prompt, 0.1)
         result = _extract_json_block(raw)
         result.setdefault("added", [])
         result.setdefault("removed", [])
@@ -1173,7 +1399,7 @@ async def compare_versions(request: Request):
 
 @app.post("/regenerate")
 @app.post("/api/regenerate")
-async def regenerate(request: Request):
+async def regenerate(request: Request, user: dict = Depends(get_current_user)):
     """Regenerate only specified formats for an existing run with updated source."""
     body = await request.json()
     run_id_ref = (body.get("run_id") or "").strip()
@@ -1197,41 +1423,45 @@ async def regenerate(request: Request):
 
     normalized_source = _normalize_text(new_source)
 
-    try:
-        llm = get_llm()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+    if not _available_providers():
+        raise HTTPException(status_code=503, detail="No LLM provider configured.")
 
     # Extract fresh ground truth for the new source
-    gt_dict = await run_in_threadpool(extract_ground_truth, normalized_source, llm)
+    gt_dict = await run_in_threadpool(
+        extract_ground_truth, normalized_source, get_llm_for("ground_truth")
+    )
     ground_truth_str = _format_ground_truth(gt_dict)
 
-    # Regenerate only selected formats
+    # Regenerate only selected formats — each on its assigned provider
     new_results = await run_agents_concurrently(
         formats=fmt_list_raw,
         source=normalized_source,
         tone=tone,
         audience=audience,
-        llm=llm,
         ground_truth=ground_truth_str,
     )
 
     # Check consistency of newly generated formats
-    consistency = await run_in_threadpool(check_cross_format_consistency, new_results, llm)
+    consistency = await run_in_threadpool(
+        check_cross_format_consistency, new_results, get_llm_for("consistency")
+    )
 
     # Merge with existing run if run_id_ref provided
     existing_run = None
     if run_id_ref:
-        existing_run = await run_in_threadpool(_fetch_run, run_id_ref)
+        existing_run = await run_in_threadpool(_fetch_run, run_id_ref, user.get("uid"))
 
     merged_results = dict(existing_run.get("results", {})) if existing_run else {}
     merged_results.update(new_results)
 
     # Save as a new run
     new_run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    run_hash = _run_fingerprint(new_run_id, created_at, merged_results)
     preview = normalized_source[:300] + "..." if len(normalized_source) > 300 else normalized_source
     document = {
         "run_id": new_run_id,
+        "user_id": user.get("uid", "anonymous"),
         "parent_run_id": run_id_ref or None,
         "source": {
             "type": "text",
@@ -1243,10 +1473,11 @@ async def regenerate(request: Request):
         "ground_truth": gt_dict,
         "consistency": consistency,
         "results": merged_results,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "integrity": {"algo": HASH_ALGO, "run_hash": run_hash},
+        "created_at": created_at,
         "regenerated_formats": fmt_list_raw,
     }
-    await run_in_threadpool(_save_to_mongo, document)
+    await run_in_threadpool(_save_run, document)
 
     return {
         "run_id": new_run_id,
@@ -1254,6 +1485,8 @@ async def regenerate(request: Request):
         "ground_truth": gt_dict,
         "consistency": consistency,
         "results": merged_results,
+        "integrity": {"algo": HASH_ALGO, "run_hash": run_hash},
+        "created_at": created_at,
         "regenerated_formats": fmt_list_raw,
     }
 
@@ -1351,8 +1584,27 @@ def _build_pptx(outline: str, title: str = "Presentation") -> bytes:
 
     buf = io.BytesIO()
     prs.save(buf)
-    buf.seek(0)
-    return buf.read()
+    return _normalise_ooxml(buf.getvalue())
+
+
+def _normalise_ooxml(data: bytes) -> bytes:
+    """python-pptx / lxml writes each part's XML declaration with SINGLE quotes
+    (<?xml version='1.0' ...?>). PowerPoint and Google Slides tolerate this;
+    Apple Keynote rejects the file as "invalid format". Rewrite every part's
+    declaration to the double-quoted form, preserving zip order and compression."""
+    bad = b"<?xml version='1.0' encoding='UTF-8' standalone='yes'?>"
+    good = b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    src, out = io.BytesIO(data), io.BytesIO()
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(out, "w") as zout:
+        for item in zin.infolist():
+            content = zin.read(item.filename)
+            if item.filename.endswith((".xml", ".rels")):
+                content = content.replace(bad, good, 1)
+            zi = zipfile.ZipInfo(item.filename, date_time=item.date_time)
+            zi.compress_type = item.compress_type
+            zi.external_attr = item.external_attr
+            zout.writestr(zi, content)
+    return out.getvalue()
 
 
 def _build_pdf(content: str, format_name: str) -> bytes:
@@ -1459,7 +1711,7 @@ def _build_pdf(content: str, format_name: str) -> bytes:
 
 @app.post("/export/pptx")
 @app.post("/api/export/pptx")
-async def export_pptx(request: Request):
+async def export_pptx(request: Request, _user: dict = Depends(get_current_user)):
     body = await request.json()
     content = body.get("content", "")
     run_title = body.get("title", "Presentation")
@@ -1468,20 +1720,22 @@ async def export_pptx(request: Request):
     try:
         pptx_bytes = await run_in_threadpool(_build_pptx, content, run_title)
     except Exception as exc:
-        print(f"[PPTX] Build failed: {exc}")
-        raise HTTPException(status_code=500, detail="Failed to generate PPTX file.")
-    return StreamingResponse(
-        io.BytesIO(pptx_bytes),
+        import traceback
+        print(f"[PPTX] Build failed: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate PPTX file: {exc}")
+    return Response(
+        content=pptx_bytes,
         media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
         headers={
-            "Content-Disposition": f'attachment; filename="omniformat-presentation.pptx"'
+            "Content-Disposition": 'attachment; filename="omniformat-presentation.pptx"',
+            "Content-Length": str(len(pptx_bytes)),
         },
     )
 
 
 @app.post("/export/pdf")
 @app.post("/api/export/pdf")
-async def export_pdf(request: Request):
+async def export_pdf(request: Request, _user: dict = Depends(get_current_user)):
     body = await request.json()
     content = body.get("content", "")
     format_name = body.get("format_name", "Document")
@@ -1490,12 +1744,15 @@ async def export_pdf(request: Request):
     try:
         pdf_bytes = await run_in_threadpool(_build_pdf, content, format_name)
     except Exception as exc:
-        print(f"[PDF] Build failed: {exc}")
-        raise HTTPException(status_code=500, detail="Failed to generate PDF file.")
-    return StreamingResponse(
-        io.BytesIO(pdf_bytes),
+        import traceback
+        print(f"[PDF] Build failed: {exc}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF file: {exc}")
+    safe_name = format_name.lower().replace(" ", "-")
+    return Response(
+        content=pdf_bytes,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'attachment; filename="omniformat-{format_name.lower().replace(" ", "-")}.pdf"'
+            "Content-Disposition": f'attachment; filename="omniformat-{safe_name}.pdf"',
+            "Content-Length": str(len(pdf_bytes)),
         },
     )

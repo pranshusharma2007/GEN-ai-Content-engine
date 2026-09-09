@@ -7,6 +7,9 @@ python-docx
 httpx
 trafilatura
 groq
-pymongo
+google-genai
+google-auth
+firebase-admin
+supabase
 python-pptx
 reportlab

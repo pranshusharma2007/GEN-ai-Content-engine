@@ -305,7 +305,10 @@ def client():
     }))
 
     with patch("main.get_llm", return_value=mock_llm), \
-         patch("main._save_to_mongo", return_value=None), \
+         patch("main.get_llm_for", lambda task=None: mock_llm), \
+         patch("main.get_llm_for_format", lambda fmt=None: mock_llm), \
+         patch("main._available_providers", return_value=["groq"]), \
+         patch("main._save_run", return_value=None), \
          patch("main._fetch_history", return_value=[]), \
          patch("main._fetch_run", return_value=None):
         yield TestClient(app)
@@ -383,7 +386,10 @@ def test_transform_advisory_format(client):
     smart_llm.chat.side_effect = smart_mock
 
     with patch("main.get_llm", return_value=smart_llm), \
-         patch("main._save_to_mongo", return_value=None):
+         patch("main.get_llm_for", lambda task=None: smart_llm), \
+         patch("main.get_llm_for_format", lambda fmt=None: smart_llm), \
+         patch("main._available_providers", return_value=["groq"]), \
+         patch("main._save_run", return_value=None):
         resp = client.post("/transform", data={
             "text": "Acme Corp reported 23% revenue growth in Q4 2024.",
             "formats": '["advisory"]',
@@ -397,6 +403,121 @@ def test_transform_advisory_format(client):
         data = resp.json()
         assert "results" in data
         assert "run_id" in data
+        # Phase 3: every successful format carries a SHA-256 fingerprint
+        assert data["integrity"]["algo"] == "sha256"
+        assert len(data["integrity"]["run_hash"]) == 64
+        adv = data["results"]["advisory"]
+        assert adv["hash_algo"] == "sha256"
+        from main import _sha256
+        assert adv["hash"] == _sha256(adv["content"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 16-18. Tamper-evident integrity (Phase 3)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_sha256_helper_and_fingerprint():
+    from main import _sha256, _run_fingerprint
+    assert _sha256("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    assert _sha256(None) == _sha256("")
+    fp1 = _run_fingerprint("run-1", "2026-01-01T00:00:00Z", {"advisory": {"hash": "aa"}})
+    fp2 = _run_fingerprint("run-1", "2026-01-01T00:00:00Z", {"advisory": {"hash": "bb"}})
+    assert fp1 != fp2 and len(fp1) == 64
+
+
+_FAKE_RUN = {
+    "run_id": "run-xyz",
+    "created_at": "2026-01-01T00:00:00Z",
+    "results": {
+        "advisory": {
+            "status": "success",
+            "content": "EXECUTIVE SUMMARY:\nGrounded advisory text.",
+            "hash": None,  # filled below
+            "hash_algo": "sha256",
+        }
+    },
+}
+
+
+def test_verify_endpoint_matches_and_detects_tamper(client):
+    from main import _sha256
+    run = json.loads(json.dumps(_FAKE_RUN))
+    original = run["results"]["advisory"]["content"]
+    run["results"]["advisory"]["hash"] = _sha256(original)
+
+    with patch("main._fetch_run", return_value=run):
+        ok = client.post("/verify", json={
+            "run_id": "run-xyz", "format_name": "advisory", "content": original,
+        })
+        assert ok.status_code == 200
+        assert ok.json()["verified"] is True
+
+        bad = client.post("/verify", json={
+            "run_id": "run-xyz", "format_name": "advisory",
+            "content": original + " (secretly altered)",
+        })
+        assert bad.status_code == 200
+        body = bad.json()
+        assert body["verified"] is False
+        assert body["stored_hash"] != body["computed_hash"]
+
+        # No content supplied → checks the stored copy, which must still match.
+        stored = client.get("/verify/run-xyz/advisory")
+        assert stored.status_code == 200
+        assert stored.json()["verified"] is True
+
+
+def test_verify_endpoint_unknown_run_and_format(client):
+    with patch("main._fetch_run", return_value=None):
+        r = client.post("/verify", json={"run_id": "nope", "format_name": "advisory"})
+        assert r.status_code == 404
+    with patch("main._fetch_run", return_value={"run_id": "r", "results": {}}):
+        r = client.post("/verify", json={"run_id": "r", "format_name": "advisory"})
+        assert r.status_code == 404
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 19-21. Per-format LLM routing
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_format_provider_defaults():
+    from main import FORMAT_PROVIDER
+    assert FORMAT_PROVIDER["linkedin"] == "groq"
+    assert FORMAT_PROVIDER["x_thread"] == "groq"
+    assert FORMAT_PROVIDER["executive_summary"] == "gemini"
+    assert FORMAT_PROVIDER["presentation"] == "gemini"
+    assert set(FORMAT_PROVIDER) == set(__import__("main").SUPPORTED_FORMATS)
+
+
+def test_routed_llm_prefers_assigned_provider_with_fallback():
+    from main import _RoutedLLM
+    with patch("main._available_providers", return_value=["groq", "gemini"]):
+        r = _RoutedLLM("gemini", "gen:advisory")
+        assert r.preferred == "gemini"
+        assert r._order == ["gemini", "groq"]  # falls back to groq
+    with patch("main._available_providers", return_value=["groq"]):
+        r = _RoutedLLM("gemini", "gen:advisory")
+        assert r.preferred == "groq"  # assigned unavailable → other provider
+
+
+def test_health_exposes_format_routing(client):
+    data = client.get("/health").json()
+    assert data["format_routing"]["linkedin"] == "groq"
+    assert "task_routing" in data
+
+
+def test_transform_records_provider_per_format(client):
+    """Each generated output carries which provider it was assigned / served by."""
+    resp = client.post("/transform", data={
+        "text": "ACME Corp reported 23% revenue growth in Q4 2024, its best quarter on record.",
+        "formats": '["linkedin", "advisory"]',
+        "tone": "Professional",
+        "audience": "Leadership / Execs",
+    })
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert results["linkedin"]["provider"]["assigned"] == "groq"
+    assert results["advisory"]["provider"]["assigned"] == "gemini"
 
 
 if __name__ == "__main__":
